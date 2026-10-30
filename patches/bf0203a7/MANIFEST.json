@@ -1,0 +1,72 @@
+{
+  "manifest_version": 1,
+  "patch_name": "hermes-feishu-card",
+  "description": "Feishu streaming-card presentation for Hermes Agent (one bounded card per reply, tool/narration status, footer note)",
+  "upstream_repo": "https://github.com/NousResearch/hermes-agent",
+  "upstream_commit": "bf0203a794a07aac3ff764972ab9087baa4e4f4e",
+  "patch_file": "hermes-feishu-card.patch",
+  "patch_sha256": "4dac6d983eed277f71581cc3cb0a5863fa1aaad150809119cf96e9c6b601e3b1",
+  "hunks": 59,
+  "files": {
+    "gateway/platforms/base.py": {
+      "path": "gateway/platforms/base.py",
+      "original_sha256": "e2ab51d8ae41933741644d65b87bdeabbf20a641d218b055f681ea96d245340e",
+      "patched_sha256": "2ddd724a36a16bdaeb5fc711e2690e52aeb14847f4358a7c281a4c5c6d6f8b0d",
+      "new_file": false
+    },
+    "gateway/run_turn.py": {
+      "path": "gateway/run_turn.py",
+      "original_sha256": "d26c177a4c0edcdd8f901d4b1b7db789c1aa534d72177645afdab32af5509b7d",
+      "patched_sha256": "b42b29281e28fe846f6aaf94920b56329ae1609569a2441c8e37bf42b5f61804",
+      "new_file": false
+    },
+    "gateway/run_turn_persistence.py": {
+      "path": "gateway/run_turn_persistence.py",
+      "original_sha256": "31d1d1869b5c9d9d08b8f57bd3ccde4dd9c2844c4a2f74fae991d28842363880",
+      "patched_sha256": "4bdd146ac3d11d5ef046e7338b82bd7d0b877d4ebe8adbebba98351881a9817e",
+      "new_file": false
+    },
+    "gateway/run_turn_runner.py": {
+      "path": "gateway/run_turn_runner.py",
+      "original_sha256": "04f76f4857a8ba251b014d615b814f3920fef8212ad24e69b28fbbc4fdf2df39",
+      "patched_sha256": "f5558d7688256db143701c74c3091816302c13d26755ef9e1b7d2cddb969a82b",
+      "new_file": false
+    },
+    "gateway/run_turn_progress.py": {
+      "path": "gateway/run_turn_progress.py",
+      "original_sha256": "66dfcdb8696a3240a2a811cb6b05df3bacfc1bc563067dfff3d55704fd561d81",
+      "patched_sha256": "1a77441ef8aa0c2132e5ca7c0143eee4e32cb2e50dc743c3a9d7f836620db0a4",
+      "new_file": false
+    },
+    "gateway/runtime_footer.py": {
+      "path": "gateway/runtime_footer.py",
+      "original_sha256": "811506465cb8ac81a4b432178558b05cb2d40dd7738c4746f264a13bc3fce9ea",
+      "patched_sha256": "90c9674aaf999222afcc5528c46c35d0ad1af552cfdced5d696de47655baa0f3",
+      "new_file": false
+    },
+    "gateway/stream_consumer.py": {
+      "path": "gateway/stream_consumer.py",
+      "original_sha256": "467c6388257d1b312233ed64604b38410e9634c8e08e996b517e402d1b7953d6",
+      "patched_sha256": "5e7c85c2ead404d1151df55382079971025782bcb41ef7f4a553a2e41d32278e",
+      "new_file": false
+    },
+    "plugins/platforms/feishu/adapter.py": {
+      "path": "plugins/platforms/feishu/adapter.py",
+      "original_sha256": "7f2588009aa9cc488e9280b527a31c29c37c1141065ceb3643460a3f3d5e7949",
+      "patched_sha256": "fd2cbf66f7dac27bcd6cb7bd726062f4aa0ff3e833103004797d68117c4048c5",
+      "new_file": false
+    },
+    "plugins/platforms/feishu/card_stream.py": {
+      "path": "plugins/platforms/feishu/card_stream.py",
+      "original_sha256": null,
+      "patched_sha256": "1b22f7dc4c9f3f6aa577ac173db16c7cd228bc0ca64e165531651cc1d19377af",
+      "new_file": true
+    },
+    "plugins/platforms/feishu/cardkit_v2.py": {
+      "path": "plugins/platforms/feishu/cardkit_v2.py",
+      "original_sha256": null,
+      "patched_sha256": "f48e6f6683973d97c366a2158f8039292a95305aad81590e9f1953398c9ea8fb",
+      "new_file": true
+    }
+  }
+}

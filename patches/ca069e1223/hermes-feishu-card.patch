@@ -1,0 +1,2990 @@
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -3571,7 +3571,7 @@
+                         len(text), event.source.chat_id)
+         result = await self._send_with_retry(
+             chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
+-            metadata=_mark_notify_metadata(thread_meta))
++            metadata={**_mark_notify_metadata(thread_meta), "is_final_response": True})
+         if eph_ttl > 0 and result.success and result.message_id:
+             self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+ 
+@@ -4355,6 +4355,17 @@
+             return
+         record_delivery(result)
+ 
++    async def send_footer(
++        self, chat_id: str, footer: str, metadata: Optional[dict[str, Any]] = None, *,
++        reply_to: Optional[str] = None,
++    ) -> SendResult:
++        """Deliver the runtime footer that belongs to the message just streamed.
++
++        Streaming hands the body over before the usage numbers are known, so the gateway sends the
++        footer as a trailing message. Card-capable adapters override this to fold the footer into
++        the live message in place; the default is an ordinary send (a small trailing message)."""
++        return await self.send(chat_id, footer, reply_to=reply_to, metadata=metadata)
++
+     async def send_final_ledgered(
+         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any], *,
+         reply_to: Optional[str], is_ephemeral_response: bool = False,
+@@ -4369,6 +4380,15 @@
+         delivery_adapter = self._final_delivery_adapter(event.source)
+         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
+                     len(text_content), event.source.chat_id)
++        # Mark the turn's final reply so a card-capable adapter renders it as a finished
++        # card rather than a text bubble; the runtime footer (when present) rides in
++        # metadata so the adapter can fold it into the card note instead of appending it
++        # to the body a second time.
++        metadata = {**(metadata or {}), "is_final_response": True}
++        if not metadata.get("runtime_footer"):
++            _footer = getattr(event, "_runtime_footer_line", "")
++            if _footer:
++                metadata["runtime_footer"] = _footer
+         obligation_id = await self._record_delivery_obligation(
+             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+         if obligation_id is not None:
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -311,6 +311,12 @@
+             )
+             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
+             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
++            # Stash the footer on the event so a card-capable adapter can lift it out of the
++            # body and render it as the streaming card's note (the body still carries it for
++            # every other platform).
++            if _footer_line:
++                with suppress(Exception):
++                    event._runtime_footer_line = _footer_line
+             # Streaming already delivered the body: the footer goes out as a trailing send instead.
+             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
+                 response = f"{response}\n\n{_footer_line}"
+@@ -2293,6 +2299,14 @@
+                 session_key, agent_holder[0], _executor_task_holder[0]
+             ):
+                 break
++            _card_stream = turn_ctx.stream_consumer_holder[0] if turn_ctx.stream_consumer_holder else None
++            if (_card_stream is not None
++                    and getattr(_card_stream, "accepts_card_stream_events", False)
++                    and getattr(_card_stream, "card_streaming_active", False)):
++                # The streaming card already shows elapsed time / step / last tool, and it
++                # refreshes every 15s. A separate "⏳ Working — N min" bubble would duplicate
++                # that progress and break the one-card presentation.
++                continue
+             _elapsed_mins = int((time.time() - _notify_start) // 60)
+             # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
+             _status_detail = ""
+--- a/gateway/run_turn_persistence.py
++++ b/gateway/run_turn_persistence.py
+@@ -183,7 +183,8 @@
+ 
+     def _hmwa_runtime_footer_line(self, agent_result, source, _turn_seconds):
+         """Runtime-metadata footer for the FINAL message of the turn; off by default
+-        (display.runtime_footer.enabled=false)."""
++        (display.runtime_footer.enabled=false).  When streaming already delivered the body
++        this line is folded into the streaming card as its note."""
+         from gateway.run import _load_gateway_config, _platform_config_key, _terminal_scope_cwd
+         try:
+             from gateway.runtime_footer import build_footer_line as _bfl
+@@ -195,6 +196,11 @@
+                 cwd=_terminal_scope_cwd(""), turn_seconds=_turn_seconds,
+                 requested_model=agent_result.get("requested_model"),
+                 served_model=agent_result.get("served_model"),
++                # Prompt-cache hit rate + last-call generation speed (openclaw footer parity).
++                cache_read_tokens=agent_result.get("cache_read_tokens", 0) or 0,
++                prompt_tokens=agent_result.get("prompt_tokens", 0) or 0,
++                output_tokens=agent_result.get("api_output_tokens", 0) or 0,
++                api_latency_seconds=agent_result.get("api_latency_seconds") or None,
+             )
+         except Exception as _footer_err:
+             logger.debug("runtime_footer build failed: %s", _footer_err)
+@@ -500,7 +506,19 @@
+             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
+             if _footer_line and adapter:
+                 try:
+-                    await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
++                    # Card-capable adapters fold the footer into the streamed message (Feishu
++                    # streaming card note); everyone else gets a small trailing message.
++                    send_footer = getattr(adapter, "send_footer", None)
++                    if callable(send_footer):
++                        await send_footer(
++                            source.chat_id, _footer_line,
++                            metadata=self._event_thread_metadata(event, source),
++                        )
++                    else:
++                        await adapter.send(
++                            source.chat_id, _footer_line,
++                            metadata=self._event_thread_metadata(event, source),
++                        )
+                 except Exception as _e:
+                     logger.debug("trailing footer send failed: %s", _e)
+             # Return None so the body isn't sent twice; stash the delivered text on the event for the
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -35,6 +35,18 @@
+ 
+ # Log-record parity with the origin module.
+ logger = logging.getLogger("gateway.run")
++
++
++def _last_metric(history: Any, default: Any) -> Any:
++    """Newest entry of a per-call metric history (``_api_output_history`` / ``_api_latency_history``),
++    or ``default`` when the history is missing/empty or the tail is non-numeric. Coerced to the type
++    of ``default`` so the runtime-footer math never sees a stray ``str``/``None``."""
++    try:
++        if history and len(history) > 0:
++            return type(default)(history[-1])
++    except (TypeError, ValueError, IndexError):
++        pass
++    return default
+ 
+ # Consecutive turns a session's persisted transcript may lag its live cached history before
+ # _load_turn_history escalates the lag line from WARNING to ERROR (#114266: 11 days of WARNING).
+@@ -273,7 +285,13 @@
+             if unseen:
+                 return
+             if stream_consumer is not None:
+-                stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)
++                if getattr(stream_consumer, "accepts_card_stream_events", False):
++                    # Streaming card: narration becomes the card's single ticker line
++                    # (never a separate bubble); streamed-finals need no segment break.
++                    if not already_streamed:
++                        stream_consumer.on_card_commentary(text)
++                else:
++                    stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)
+             elif not already_streamed and ctx._status_adapter and str(text or "").strip():
+                 self._send_status_text(text, ctx._status_thread_metadata, "interim_assistant_callback scheduling error")
+ 
+@@ -1282,6 +1300,12 @@
+             "output_tokens": getattr(agent, "session_completion_tokens", 0) if has_comp else 0,
+             "model": getattr(agent, "model", None) if agent else None,
+             "context_length": (getattr(comp, "context_length", 0) or 0) if has_comp else 0,
++            # Per-turn runtime-footer stats: prompt-cache hit rate + last-call generation speed
++            # (openclaw-feishu-patch footer parity: model · context% · cache% · tok/s).
++            "prompt_tokens": getattr(agent, "session_prompt_tokens", 0) if agent else 0,
++            "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) if agent else 0,
++            "api_output_tokens": _last_metric(getattr(agent, "_api_output_history", None), 0),
++            "api_latency_seconds": _last_metric(getattr(agent, "_api_latency_history", None), 0.0),
+             # The rest of the `-z --usage-file` ledger (hermes_cli/oneshot._USAGE_KEYS): a finite
+             # viewer reads the committed result over `prompt.receipt`, so the projection must keep
+             # what the in-process one-shot took straight from `run_conversation`.
+--- a/gateway/run_turn_progress.py
++++ b/gateway/run_turn_progress.py
+@@ -104,6 +104,21 @@
+         holder = self._ctx.stream_consumer_holder
+         return holder[0] if holder else None
+ 
++    @staticmethod
++    def _card_tool_detail(preview, args) -> str:
++        """Short tool-argument preview for the card status ("terminal: ssh …")."""
++        text = ""
++        if isinstance(preview, str) and preview.strip():
++            text = preview
++        elif isinstance(args, dict):
++            for key in ("command", "path", "file_path", "pattern", "query", "url"):
++                value = args.get(key)
++                if isinstance(value, str) and value.strip():
++                    text = value
++                    break
++        text = " ".join(str(text or "").split())
++        return text[:60]
++
+     def _drain_progress_queue(self) -> None:
+         q = self._ctx.progress_queue
+         with suppress(Exception):
+@@ -143,6 +158,26 @@
+             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+             preview_str = f' "{preview}"' if preview else ""
+             ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
++        # Streaming-card transports fold tool progress into the card's compact status
++        # block instead of sending a separate progress bubble (openclaw-feishu-patch
++        # presentation).  The event is queued on the consumer (thread-safe) and the
++        # bubble path below is skipped entirely.  ``tool_progress: off`` still means
++        # off: the card then shows only prewarm/generation status, no tool lines.
++        _card_consumer = self._stream_consumer()
++        if _card_consumer is not None and getattr(_card_consumer, "accepts_card_stream_events", False):
++            if event_type == "_thinking" or tool_name == "_thinking":
++                # Scratch reasoning never becomes a bubble and is not rendered in the
++                # card (classic cards have no collapsible reasoning section).
++                return
++            if (event_type in {"tool.started", "tool.completed"} and tool_name
++                    and tool_name != "clarify"):
++                if ctx.tool_progress_enabled and not self._agent_interrupted():
++                    with suppress(Exception):
++                        _card_consumer.on_card_tool(
++                            event_type, tool_name, detail=self._card_tool_detail(preview, args),
++                            is_error=bool(kwargs.get("is_error", False)),
++                        )
++                return
+         if not ctx.progress_queue or not ctx._run_still_current():
+             return
+         if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
+@@ -860,6 +895,12 @@
+         if not ctx._run_still_current():
+             return
+         self._publish_execution("agent.step", {"iteration": iteration})
++        _card_consumer = self._stream_consumer()
++        if _card_consumer is not None and getattr(_card_consumer, "accepts_card_stream_events", False):
++            # The card status shows "第 N 轮" so long turns have a visible step counter
++            # even while no tool is running.
++            with suppress(Exception):
++                _card_consumer.on_card_step(iteration)
+         if iteration > 1 and local_viewer_turn(self):
+             # Each step after the first follows a finished API call: main's CLI repainted its status
+             # bar from the agent's counters right then (the last call is covered at turn end).
+@@ -959,6 +1000,20 @@
+         ctx = self._ctx
+         if ctx.mute_notification_reply or not self._status_live():
+             return
++        _card_consumer = self._stream_consumer()
++        if _card_consumer is not None and getattr(_card_consumer, "accepts_card_stream_events", False):
++            if is_warning_status(event_type, message):
++                # Provider retries / redirects / refusals are diagnostics: render them in
++                # the card status line instead of spawning one text bubble per retry.
++                if _card_consumer.on_card_notice(str(message)):
++                    logger.debug("diagnostic status folded into streaming card: %s", event_type)
++                    return
++            else:
++                # Routine progress statuses ("✍️ Writing …", tool phrases, heartbeats) are
++                # already rendered inside the card status; posting them as separate bubbles
++                # duplicates the card and breaks the one-reply presentation.
++                logger.debug("status_callback folded into streaming card: %s", event_type)
++                return
+         prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
+         if prepared is None:
+             logger.debug(
+--- a/gateway/runtime_footer.py
++++ b/gateway/runtime_footer.py
+@@ -2,12 +2,14 @@
+ minimal. Config: ``display.runtime_footer: {enabled: bool, fields: [model, context_pct, cwd]}``
+ (order shown; drop any to hide), per-platform override ``display.platforms.<p>.runtime_footer``,
+ toggled by ``/footer on|off``. Fields: ``model`` (vendor prefix dropped), ``context_pct`` (last-call
+-occupancy), ``latency`` (turn wall-clock, opt-in — NOT in the default set so an unset ``fields``
++occupancy), ``cache`` (prompt-cache hit rate of the last call), ``tok_s`` (last-call generation
++speed), ``latency`` (turn wall-clock, opt-in — NOT in the default set so an unset ``fields``
+ renders exactly as before), ``served_model`` (opt-in, ``alias → served``: the deployment a routing
+ proxy reported via ``x-litellm-model-id`` / ``x-litellm-model-api-base``, or Hermes' own fallback
+ route; skipped when the served model is the requested one), ``cwd`` (home-relative). ``gateway/run.py`` appends the footer to the
+ final response only (never to tool-progress or streaming partials); when streaming already
+-delivered the text, it goes out as a trailing message via ``send_trailing_footer()``."""
++delivered the text, it is folded into the streaming card as its note (Feishu) or sent as a
++trailing message via ``send_footer()``."""
+ 
+ from __future__ import annotations
+ 
+@@ -77,12 +79,27 @@
+                           context_length: Optional[int], cwd: Optional[str] = None,
+                           turn_seconds: Optional[float] = None,
+                           requested_model: Optional[str] = None, served_model: Optional[str] = None,
++                          cache_read_tokens: int = 0, prompt_tokens: int = 0,
++                          output_tokens: int = 0, api_latency_seconds: Optional[float] = None,
+                           fields: Iterable[str] = _DEFAULT_FIELDS) -> str:
+     """Render the footer line, or "" if no fields have data. Fields whose data is missing (and
+     unknown field names) are skipped silently — a partial footer beats ``?%`` or empty slots."""
+     def context_pct() -> str:
+         if context_length and context_length > 0 and context_tokens >= 0:
+             return f"{max(0, min(100, round((context_tokens / context_length) * 100)))}%"
++        return ""
++
++    def cache_hit() -> str:
++        # Prompt-cache hit rate for the most recent call: cache-read tokens / prompt tokens.
++        if cache_read_tokens > 0 and prompt_tokens > 0:
++            pct = max(0, min(100, round((cache_read_tokens / prompt_tokens) * 100)))
++            return f"cache {pct}%"
++        return ""
++
++    def tok_s() -> str:
++        # Generation speed of the most recent API call: output tokens / call latency.
++        if output_tokens > 0 and api_latency_seconds and api_latency_seconds > 0:
++            return f"{output_tokens / api_latency_seconds:.1f} tok/s"
+         return ""
+ 
+     def served() -> str:
+@@ -96,6 +113,8 @@
+         "model": lambda: _model_short(model),
+         "served_model": served,
+         "context_pct": context_pct,
++        "cache": cache_hit,
++        "tok_s": tok_s,
+         # Skipped when the caller did not measure (None) or the value is negative.
+         "latency": lambda: _format_latency(turn_seconds) if turn_seconds is not None and turn_seconds >= 0 else "",
+         "cwd": lambda: _home_relative_cwd(cwd or _env_cwd()),
+@@ -106,7 +125,9 @@
+ def build_footer_line(*, user_config: dict[str, Any] | None, platform_key: str | None,
+                       model: Optional[str], context_tokens: int, context_length: Optional[int],
+                       cwd: Optional[str] = None, turn_seconds: Optional[float] = None,
+-                      requested_model: Optional[str] = None, served_model: Optional[str] = None) -> str:
++                      requested_model: Optional[str] = None, served_model: Optional[str] = None,
++                      cache_read_tokens: int = 0, prompt_tokens: int = 0,
++                      output_tokens: int = 0, api_latency_seconds: Optional[float] = None) -> str:
+     """Entry point for gateway/run.py: footer text, or "" when disabled / no data. Callers append it
+     to the final response themselves, preserving a single blank line of separation.
+     ``turn_seconds`` is the caller-measured (``time.monotonic()``) run duration; ``None`` skips the
+@@ -117,4 +138,6 @@
+     return format_runtime_footer(model=model, context_tokens=context_tokens,
+                                  context_length=context_length, cwd=cwd, turn_seconds=turn_seconds,
+                                  requested_model=requested_model, served_model=served_model,
++                                 cache_read_tokens=cache_read_tokens, prompt_tokens=prompt_tokens,
++                                 output_tokens=output_tokens, api_latency_seconds=api_latency_seconds,
+                                  fields=cfg.get("fields") or _DEFAULT_FIELDS)
+--- a/gateway/stream_consumer.py
++++ b/gateway/stream_consumer.py
+@@ -40,13 +40,18 @@
+ # Queue sentinels (see _drain_queue()).  Bare: _DONE, _NEW_SEGMENT (finalize, start a
+ # fresh message), _REOPEN_SEED (EAGER native re-seed after a clarify answer — WeCom
+ # typing is driven by the seed frame; lazy re-seed measured 48s of dead air).  Tuples:
+-# (_COMMENTARY, text); (_TOOL_PROGRESS, line) native-bubble overlay; (_FINAL_TEXT, text)
++# (_COMMENTARY, text); (_TOOL_PROGRESS, line) native-bubble overlay; (_CARD_TOOL, kind,
++# tool_name) / (_CARD_COMMENT, text) streaming-card status events; (_FINAL_TEXT, text)
+ # authoritative final_response incl. post-stream augmentation, queued just before _DONE;
+ # (_FLUSH, threading.Event) barrier; (_APPROVAL_BOUNDARY, future, cancelled_flag).
+ _DONE = object()
+ _NEW_SEGMENT = object()
+ _COMMENTARY = object()
+ _TOOL_PROGRESS = object()
++_CARD_TOOL = object()
++_CARD_COMMENT = object()
++_CARD_STEP = object()
++_CARD_NOTICE = object()
+ _FINAL_TEXT = object()
+ _FLUSH = object()
+ _APPROVAL_BOUNDARY = object()
+@@ -55,6 +60,12 @@
+ 
+ # Boundary finalize text when nothing has accumulated yet (overridable per boundary).
+ _DEFAULT_BOUNDARY_PLACEHOLDER = "⏸ 等待审批中..."
++
++
++def _is_card_rate_limit(error: str) -> bool:
++    """Feishu per-message update frequency limit (transient, retryable)."""
++    text = str(error or "").lower()
++    return "230020" in text or "frequency limit" in text or "too frequently" in text
+ 
+ 
+ @dataclass
+@@ -86,6 +97,8 @@
+     got_reopen_seed: bool = False
+     approval_boundary: Optional[tuple] = None  # (future, cancelled_flag)
+     commentary_text: Optional[str] = None
++    # A streaming-card status/tool/narration event arrived this tick.
++    card_dirty: bool = False
+     # Set by _push_update for _finalize_turn / _end_segment.
+     update_visible: bool = False
+     draft_final_fresh_send: bool = False
+@@ -188,6 +201,21 @@
+         self._awaiting_reopen_after_boundary = False
+         self._reopen_seeded_eagerly = False
+ 
++        # Streaming-card transport (Feishu, openclaw-feishu-patch parity): ONE bounded
++        # interactive card per turn.  The adapter is probed in _start_transports(); the
++        # card state machine (body + tool/narration status) is rendered into
++        # metadata["hermes_card_stream"] on every send/edit.
++        self._use_card_streaming = False
++        self._card_turn: Any = None  # plugins.platforms.feishu.card_stream.CardStreamTurn
++        self._card_last_send_ts = 0.0
++        self._card_last_status_sig = ""
++        self._card_last_payload_sig = ""
++        self._card_pending_sep = False
++        self._card_update_interval = max(0.2, float(getattr(self.cfg, "edit_interval", 0.8) or 0.8))
++        self._card_min_patch_interval = 1.0  # Feishu per-message updates are stricter than the app QPS
++        self._card_pending = False
++        self._last_card_error = ""
++
+     def _reset_message_state(self) -> None:
+         """Per-message (segment) state: fresh at construction and after each segment break."""
+         self._message_id: Optional[str] = None
+@@ -240,13 +268,59 @@
+ 
+     @property
+     def accepts_tool_progress(self) -> bool:
+-        """True only when native streaming is active (gates in-stream tool progress)."""
+-        return self._use_native_streaming
++        """True when tool progress can be overlaid in-stream (native bubble or streaming card)."""
++        return self._use_native_streaming or self._use_card_streaming
++
++    @property
++    def accepts_card_stream_events(self) -> bool:
++        """True when the turn renders as ONE streaming card (status/tool/narration fold-in)."""
++        return self._use_card_streaming
+ 
+     def on_tool_progress(self, line: str) -> None:
+         """Thread-safe: overlay a tool-progress line in the native bubble until the next delta."""
+         if line:
+             self._queue.put((_TOOL_PROGRESS, line))
++
++    def on_card_tool(self, event_type: str, tool_name: Optional[str] = None, detail: str = "",
++                     is_error: bool = False) -> None:
++        """Thread-safe: queue a tool lifecycle event for the streaming card status."""
++        if not self._use_card_streaming:
++            return
++        self._queue.put((_CARD_TOOL, str(event_type or ""), str(tool_name or ""), str(detail or ""),
++                         bool(is_error)))
++
++    def on_card_notice(self, text: str) -> bool:
++        """Thread-safe: render a transient gateway diagnostic in the card status line.
++
++        Returns True when the card consumed it; False lets the caller fall back to the
++        ordinary status-bubble path.
++        """
++        if not self._use_card_streaming or not str(text or "").strip():
++            return False
++        self._queue.put((_CARD_NOTICE, str(text)))
++        return True
++
++    def on_card_step(self, iteration: int) -> None:
++        """Thread-safe: agent iteration counter (kept for wiring compatibility)."""
++        if not self._use_card_streaming:
++            return
++        try:
++            value = int(iteration)
++        except (TypeError, ValueError):
++            return
++        if value > 0:
++            self._queue.put((_CARD_STEP, value))
++
++    @property
++    def card_streaming_active(self) -> bool:
++        """True while this turn is still rendering into a live streaming card."""
++        return bool(self._use_card_streaming and self._card_turn is not None)
++
++    def on_card_commentary(self, text: str) -> None:
++        """Thread-safe: queue mid-turn narration for the card's single ticker line."""
++        if not self._use_card_streaming or not str(text or "").strip():
++            return
++        self._queue.put((_CARD_COMMENT, str(text)))
+ 
+     def _compose_frame_content(self) -> str:
+         """Native frame content: text, with any tool-progress lines below a rule."""
+@@ -290,6 +364,12 @@
+         if self._tool_progress_lines:  # real text overwrites the overlay
+             self._tool_progress_lines.clear()
+             self._tool_progress_active = False
++        if self._use_card_streaming and self._card_pending_sep:
++            # Tool/segment boundary in card mode: keep ONE body, separate blocks with a
++            # blank line instead of resetting into a second message.
++            self._card_pending_sep = False
++            if self._accumulated:
++                text = "\n\n" + text
+         self._accumulated += text
+         self._stream_ledger += text
+ 
+@@ -473,6 +553,13 @@
+         kept open across a prompt: the WeCom finalize ack only confirms server receipt, and
+         after a long idle gap the client may stop tracking the stream."""
+         _reason = self._boundary_reason or "Approval"
++        if self._use_card_streaming:
++            # Card mode keeps the card across the prompt: the approval/clarify prompt is
++            # its own interactive card and post-answer deltas continue in this card.
++            with contextlib.suppress(Exception):
++                if isinstance(boundary_future, _FUTURE_TYPES) and not boundary_future.done():
++                    boundary_future.set_result(True)
++            return
+         try:
+             boundary_ok = True
+             if self._native_stream_opened:
+@@ -571,6 +658,26 @@
+                         await self._suppress_silence_marker()
+                         return
+ 
++                if self._use_card_streaming:
++                    # ONE interactive card per turn: answer body + folded tool/narration
++                    # status; tool boundaries never split it into a second bubble.
++                    await self._card_push_update(tick)
++                    if tick.got_done:
++                        await self._finalize_turn(tick)
++                        return
++                    if tick.commentary_text is not None:
++                        await self._deliver_commentary(tick.commentary_text)
++                    elif tick.got_segment_break:
++                        # Mark the paragraph break so the next answer block appends
++                        # under the same card body with a blank line, never a new card.
++                        await self._end_segment(tick)
++                    # A segment break is cumulative in card mode: no message reset.
++                    if tick.got_flush:
++                        self._signal_flush(tick.flush_event)
++                    await self._card_maybe_elapsed_refresh()
++                    await asyncio.sleep(0.05)
++                    continue
++
+                 if self._should_edit(tick) and (
+                     self._accumulated or (self._use_native_streaming and self._tool_progress_active)
+                 ):
+@@ -642,6 +749,17 @@
+                 self._use_draft_streaming = False
+                 return
+             self._use_native_streaming = False
++        if self._resolve_card_streaming():
++            self._use_card_streaming = True
++            logger.debug("Stream consumer using streaming-card transport (chat=%s)", self.chat_id)
++            self._init_card_turn()
++            if await self._prewarm_card():
++                self._use_draft_streaming = False
++                return
++            # Prewarm failed: fall back to the ordinary edit transport for this turn.
++            logger.info("Streaming-card prewarm failed (chat=%s); falling back to edit transport", self.chat_id)
++            self._use_card_streaming = False
++            self._card_turn = None
+         self._use_draft_streaming = self._resolve_draft_streaming()
+         # Native draft streaming: bump the draft_id so the next text segment animates as a fresh preview
+         # below the tool-progress bubbles, not over the prior segment's already-finalized draft. This is how
+@@ -652,6 +770,356 @@
+             self._bump_draft_id()
+             logger.debug("Stream consumer using native-draft transport (chat=%s draft_id=%s)",
+                          self.chat_id, self._draft_id)
++
++    # ── streaming-card transport (Feishu / openclaw-feishu-patch presentation) ──
++    #
++    # ONE bounded interactive card per turn: the card is prewarmed at reply start,
++    # answer deltas patch its body, tool lifecycle events and narration fold into a
++    # compact status block, and the final frame removes the status block and adds the
++    # runtime footer note (the adapter receives the whole state as
++    # metadata["hermes_card_stream"] and patches the Feishu card in place).
++
++    def _resolve_card_streaming(self) -> bool:
++        """Probe the adapter for a cumulative interactive-card stream transport."""
++        if not isinstance(self.adapter, _BasePlatformAdapter):
++            return False  # test doubles / duck-typed adapters keep the legacy transport
++        probe = getattr(type(self.adapter), "supports_card_streaming", None)
++        if not callable(probe):
++            return False
++        try:
++            try:
++                return probe(
++                    self.adapter, chat_id=self.chat_id, chat_type=self.cfg.chat_type or None,
++                    metadata=self.metadata,
++                ) is True
++            except TypeError:
++                return bool(probe(self.adapter))
++        except Exception:
++            logger.debug("supports_card_streaming probe raised", exc_info=True)
++            return False
++
++    def _init_card_turn(self) -> None:
++        from plugins.platforms.feishu.card_stream import CardStreamTurn
++        title = "Hermes"
++        try:
++            title = self.adapter._card_title_text()  # Feishu adapter helper (bot display name)
++        except Exception:
++            title = str(getattr(self.adapter, "_bot_name", "") or "") or title
++        self._card_turn = CardStreamTurn(title=title)
++        self._card_last_send_ts = 0.0
++        self._card_last_status_sig = ""
++        self._card_last_payload_sig = ""
++        self._card_pending_sep = False
++
++    async def _prewarm_card(self) -> bool:
++        """Send the card at reply start with an immediate status (no blank warm card)."""
++        from plugins.platforms.feishu.card_stream import CARD_STREAM_METADATA_KEY
++        turn = self._card_turn
++        if turn is None:
++            return False
++        turn.mark_prewarmed()
++        payload = turn.render_payload(time.monotonic(), final=False)
++        meta = dict(self._metadata_for_send(final=False, expect_edits=True) or {})
++        meta[CARD_STREAM_METADATA_KEY] = payload
++        try:
++            result = await self.adapter.send(
++                chat_id=self.chat_id, content="", reply_to=self._initial_reply_to_id, metadata=meta,
++            )
++        except Exception as e:
++            logger.debug("Streaming-card prewarm raised: %s", e)
++            return False
++        if not getattr(result, "success", False):
++            logger.info("Streaming-card prewarm rejected: %s", getattr(result, "error", None))
++            return False
++        if not getattr(result, "message_id", None):
++            return False
++        self._adopt_message_id(result.message_id)
++        self._track_preview_ids_from_result(result)
++        self._card_last_send_ts = time.monotonic()
++        self._card_last_status_sig = self._card_status_sig(payload)
++        return True
++
++    @staticmethod
++    def _card_status_sig(payload: dict) -> str:
++        from plugins.platforms.feishu.card_stream import status_signature
++        return status_signature(payload)
++
++    @staticmethod
++    def _card_payload_sig(payload: dict) -> str:
++        from plugins.platforms.feishu.card_stream import payload_signature
++        return payload_signature(payload)
++
++    @staticmethod
++    def _card_split_body(full_body: str) -> tuple[str, str]:
++        """Split an answer body into ``(visible_card_body, continuation_tail)``.
++
++        Cards are bounded (``card_stream.fit_card_body``); anything past the card budget
++        is delivered as continuation cards at turn-final so no text is lost.
++        """
++        from plugins.platforms.feishu.card_stream import CARD_BODY_MAX_CHARS, CARD_TRUNCATION_NOTICE
++        body = str(full_body or "")
++        if len(body) <= CARD_BODY_MAX_CHARS:
++            return body, ""
++        keep = max(0, CARD_BODY_MAX_CHARS - len(CARD_TRUNCATION_NOTICE))
++        prefix = body[:keep].rstrip()
++        return prefix + CARD_TRUNCATION_NOTICE, body[len(prefix):].lstrip()
++
++    @staticmethod
++    def _card_tail_chunks(text: str, limit: int = 6000) -> list[str]:
++        """Split overflow text into card-sized chunks at line boundaries."""
++        rest = str(text or "")
++        chunks: list[str] = []
++        while rest:
++            if len(rest) <= limit:
++                chunks.append(rest)
++                break
++            cut = rest.rfind("\n", 0, limit)
++            if cut < limit // 3:
++                cut = limit
++            chunks.append(rest[:cut])
++            rest = rest[cut:].lstrip("\n")
++        return chunks
++
++    async def _card_send_or_edit(self, *, finalize: bool = False, force: bool = False) -> bool:
++        """Send or patch the streaming card for the current state."""
++        from plugins.platforms.feishu.card_stream import CARD_STREAM_METADATA_KEY
++        turn = self._card_turn
++        if turn is None or not self._use_card_streaming:
++            return False
++        if self._accumulated:
++            turn.set_body(self._accumulated)
++        now = time.monotonic()
++        payload = turn.render_payload(now, final=finalize)
++        # Hide MEDIA:<path> / audio directives exactly like the stock stream transport
++        # does: media is delivered separately after the turn, and the card body must
++        # never show the raw directive.
++        full_body = self._clean_for_display(str(payload.get("body") or ""))
++        visible_body, continuation = self._card_split_body(full_body)
++        if continuation:
++            payload = {**payload, "body": visible_body, "truncated": True}
++        if not finalize:
++            payload_sig = self._card_payload_sig(payload)
++            status_sig = self._card_status_sig(payload)
++            changed = payload_sig != self._card_last_payload_sig or force
++            status_changed = status_sig != self._card_last_status_sig
++            if not changed:
++                self._card_pending = False
++                return True
++            # Hard floor for every card PATCH: Feishu caps a message's patch rate at
++            # ~5 QPS, so even a burst of tool events is coalesced to ≤4/s. The pending
++            # flag makes the next tick retry the deferred state change.
++            if (now - self._card_last_send_ts) < self._card_min_patch_interval:
++                self._card_pending = True
++                return True
++            # Body-only growth is rate-limited to the streaming edit interval; tool /
++            # narration status changes flush as soon as the hard floor allows.
++            if not status_changed and not force and (now - self._card_last_send_ts) < self._card_update_interval:
++                self._card_pending = True
++                return True
++        meta = dict(self._metadata_for_send(final=finalize, expect_edits=not finalize) or {})
++        meta[CARD_STREAM_METADATA_KEY] = payload
++        try:
++            if self._message_id is None:
++                result = await self.adapter.send(
++                    chat_id=self.chat_id, content=visible_body,
++                    reply_to=self._initial_reply_to_id, metadata=meta,
++                )
++            else:
++                result = await self.adapter.edit_message(
++                    chat_id=self.chat_id, message_id=self._message_id, content=visible_body,
++                    finalize=finalize, metadata=meta,
++                )
++        except Exception as e:
++            logger.warning("Streaming-card frame raised: %s", e)
++            if finalize:
++                # _card_finalize owns retries; do not delete the card between attempts.
++                return False
++            await self._card_discard_stale()
++            self._card_downgrade("frame raised", keep_prefix=False)
++            return False
++        if not getattr(result, "success", False):
++            error = str(getattr(result, "error", "") or "")
++            self._last_card_error = error
++            if _is_card_rate_limit(error):
++                # Feishu's per-message update limit is transient: back off and retry on
++                # the next tick instead of tearing the card down for the rest of the turn.
++                self._card_min_patch_interval = min(3.0, max(1.0, self._card_min_patch_interval * 1.5))
++                self._card_last_send_ts = time.monotonic()
++                self._card_pending = True
++                logger.warning(
++                    "Streaming-card frame rate-limited; backing off to %.1fs intervals: %s",
++                    self._card_min_patch_interval, error,
++                )
++                return False if finalize else True
++            logger.warning("Streaming-card frame rejected: %s", error)
++            if finalize:
++                # Keep the card for the final retry/fold path; deleting it here would
++                # force a duplicate card when the fallback re-renders the answer.
++                return False
++            await self._card_discard_stale()
++            self._card_downgrade("frame rejected", keep_prefix=False)
++            return False
++        if self._message_id is None:
++            message_id = getattr(result, "message_id", None)
++            if not message_id:
++                # The card may exist but can never be patched: stop here instead of
++                # opening a second card on the next frame.
++                logger.warning("Streaming-card frame delivered without a message id; downgrading")
++                self._card_downgrade("missing message id")
++                return False
++            self._adopt_message_id(message_id)
++            self._track_preview_ids_from_result(result)
++        self._already_sent = True
++        self._last_sent_text = visible_body
++        self._card_last_send_ts = time.monotonic()
++        self._card_last_payload_sig = self._card_payload_sig(payload)
++        self._card_last_status_sig = self._card_status_sig(payload)
++        self._card_pending = False
++        if finalize:
++            delivered = full_body
++            if continuation:
++                # Bounded head card + continuation card(s): the whole answer stays in
++                # cards (no loose text bubble after the card).
++                from plugins.platforms.feishu.card_stream import (
++                    CARD_SCHEMA_VERSION, CARD_STREAM_METADATA_KEY as _CARD_KEY,
++                    HEADER_TEMPLATE_FINAL as _FINAL_TEMPLATE,
++                )
++                tail_parts = self._card_tail_chunks(continuation)
++                tail_ok = True
++                for index, part in enumerate(tail_parts):
++                    suffix = f" · 续 {index + 1}/{len(tail_parts)}" if len(tail_parts) > 1 else " · 续"
++                    tail_payload = {
++                        "schema": CARD_SCHEMA_VERSION,
++                        "title": f"{turn.title}{suffix}",
++                        "body": part,
++                        "status": "",
++                        "details": "",
++                        "stats": {},
++                        "chat_summary": "",
++                        "footer": "",
++                        "final": True,
++                        "template": _FINAL_TEMPLATE,
++                        "capsule": False,
++                    }
++                    tail_meta = dict(self._metadata_for_send(final=True, expect_edits=False) or {})
++                    tail_meta[_CARD_KEY] = tail_payload
++                    try:
++                        tail_result = await self.adapter.send(
++                            chat_id=self.chat_id, content=part, metadata=tail_meta,
++                        )
++                    except Exception as tail_err:
++                        logger.warning("Streaming-card continuation card send raised: %s", tail_err)
++                        tail_result = None
++                    if not getattr(tail_result, "success", False):
++                        logger.warning("Streaming-card continuation card send failed; gateway will resend the final")
++                        tail_ok = False
++                        break
++                if not tail_ok:
++                    delivered = visible_body
++            self._final_response_sent = True
++            self._mark_final_delivered(record=delivered)
++        return True
++
++    async def _card_discard_stale(self) -> None:
++        """Recall a half-written card before the legacy text path delivers the answer.
++
++        A stale card plus a separate full-text answer is the worst possible presentation
++        (two versions of the same reply); dropping the card and resending the complete
++        answer is cleaner. Rate-limited turns never reach here (they back off instead).
++        """
++        if self._message_id:
++            with contextlib.suppress(Exception):
++                await self.adapter.delete_message(self.chat_id, self._message_id)
++            logger.info("Discarded stale streaming card %s", self._message_id)
++        self._message_id = None
++        self._already_sent = False
++        self._last_sent_text = ""
++
++    def _card_downgrade(self, reason: str, *, keep_prefix: bool = True) -> None:
++        """Stop patching the card for this turn; the legacy transport finishes delivery.
++
++        With ``keep_prefix`` the card stays on screen, so its visible prefix is inherited
++        into the fallback and only the unseen tail is sent. When the card was discarded,
++        the fallback must resend the whole answer.
++        """
++        logger.warning("Disabling streaming-card transport for this turn: %s", reason)
++        self._use_card_streaming = False
++        prefix = ""
++        if keep_prefix:
++            with contextlib.suppress(Exception):
++                prefix = self._clean_for_display(self._last_sent_text or "")
++        with contextlib.suppress(Exception):
++            self._enter_fallback_mode(prefix)
++
++    async def _card_push_update(self, tick: _Tick) -> None:
++        """Render this tick's answer body/status into the card (final is _finalize_turn's job)."""
++        if self._card_turn is None:
++            return
++        if tick.got_done:
++            # The final frame is owned by _finalize_turn(): it can discard a warmed
++            # empty card (silent/skip turns) instead of leaving a placeholder behind.
++            return
++        force = bool(getattr(tick, "card_dirty", False)) or bool(getattr(self, "_card_pending", False))
++        await self._card_send_or_edit(finalize=False, force=force)
++
++    async def _card_finalize(self) -> bool:
++        """Close the card: final answer, status removed, footer added later by send_footer.
++
++        Returns True when the card path handled the turn-final (including deleting an
++        empty warmed card on a silent/skip turn); False means the caller should use the
++        legacy final-delivery path.
++        """
++        turn = self._card_turn
++        if turn is None or not self._use_card_streaming:
++            return False
++        await self._notify_before_finalize()
++        if turn.discard_worthy():
++            # Silent/skip turn with a warmed but empty card: discard it (reference
++            # deletes the card instead of leaving a blank one in the chat).
++            with contextlib.suppress(Exception):
++                if self._message_id:
++                    await self.adapter.delete_message(self.chat_id, self._message_id)
++            self._message_id = None
++            self._already_sent = False
++            self._final_response_sent = False
++            return True
++        # The final frame is the one frame that must land. Retry transient 230020 with
++        # exponential backoff (1.5/3/6s) and other failures once more; never delete the
++        # card between attempts. If every attempt fails, leave the card in place: the
++        # adapter's normal-final fold path either patches it (one card) or recalls it
++        # before rendering a fresh final card (never two versions of the answer).
++        delays = (0.0, 1.5, 3.0, 6.0)
++        for attempt, delay in enumerate(delays, start=1):
++            if delay:
++                logger.warning("Retrying final card frame in %.1fs (attempt %d/%d)", delay, attempt, len(delays))
++                await asyncio.sleep(delay)
++            self._last_card_error = ""
++            if await self._card_send_or_edit(finalize=True, force=True):
++                return True
++            if attempt >= len(delays):
++                break
++        self._use_card_streaming = False
++        self._final_response_sent = False
++        from plugins.platforms.feishu.card_stream import record_card_event
++        record_card_event("card_finalize_failed")
++        logger.warning("Streaming-card finalize failed after retries; deferring to normal final fallback")
++        return False
++
++    async def _card_maybe_elapsed_refresh(self) -> None:
++        """15s heartbeat: refresh the elapsed counter in whichever status line is showing.
++
++        This used to fire only for an in-flight tool phase, so a long thinking/generation
++        stretch left the card looking frozen (the gateway's separate "⏳ Working" bubble
++        was the only movement). It now covers every non-final card state.
++        """
++        turn = self._card_turn
++        if turn is None or self._message_id is None or not self._use_card_streaming:
++            return
++        if turn.final:
++            return
++        from plugins.platforms.feishu.card_stream import ELAPSED_REFRESH_SECONDS
++        if (time.monotonic() - self._card_last_send_ts) >= ELAPSED_REFRESH_SECONDS:
++            await self._card_send_or_edit(finalize=False, force=True)
+ 
+     def _drain_queue(self) -> _Tick:
+         """Drain everything queued so far into one tick.  Control sentinels stop the drain
+@@ -676,9 +1144,30 @@
+             if kind is _FINAL_TEXT:
+                 self._adopt_final_text(item[1])
+             elif kind is _TOOL_PROGRESS:  # keep draining to batch simultaneous lines
+-                if self._use_native_streaming:
++                if self._use_native_streaming or self._use_card_streaming:
+                     self._tool_progress_lines.append(item[1])
+                     self._tool_progress_active = True
++            elif kind is _CARD_TOOL:  # streaming-card status: tool lifecycle event
++                if self._card_turn is not None:
++                    event_type, tool_name = item[1], item[2]
++                    detail = item[3] if len(item) > 3 else ""
++                    is_error = bool(item[4]) if len(item) > 4 else False
++                    if event_type == "tool.started":
++                        self._card_turn.on_tool_started(tool_name, detail=detail)
++                    elif event_type == "tool.completed":
++                        self._card_turn.on_tool_completed(is_error=is_error, detail=detail)
++                    tick.card_dirty = True
++            elif kind is _CARD_STEP:  # streaming-card status: agent iteration counter
++                if self._card_turn is not None:
++                    self._card_turn.on_step(item[1])
++            elif kind is _CARD_COMMENT:  # streaming-card status: narration ticker
++                if self._card_turn is not None:
++                    self._card_turn.on_narration(item[1])
++                    tick.card_dirty = True
++            elif kind is _CARD_NOTICE:  # streaming-card status: transient gateway diagnostic
++                if self._card_turn is not None:
++                    self._card_turn.on_notice(item[1])
++                    tick.card_dirty = True
+             elif kind is _APPROVAL_BOUNDARY:
+                 tick.approval_boundary = (item[1], item[2])
+                 return tick
+@@ -851,6 +1340,11 @@
+ 
+     async def _finalize_turn(self, tick: _Tick) -> None:
+         """got_done: final edit without cursor, or one continuation send if edits failed."""
++        if self._use_card_streaming:
++            if await self._card_finalize():
++                return
++            # Card transport failed at the last frame → use the legacy final path.
++            logger.warning("Streaming-card finalize failed; falling back to legacy delivery")
+         if self._accumulated or self._message_id is not None or self._already_sent:
+             await self._notify_before_finalize()
+         if self._reopen_seed_pending() and not self._accumulated:
+@@ -907,13 +1401,22 @@
+         return self._final_response_sent
+ 
+     def _cumulative_transport(self) -> bool:
+-        """Stream-is-the-message drafts and WeCom native: one append-only stream per turn."""
++        """Stream-is-the-message drafts, WeCom native and the Feishu streaming card:
++        one append-only stream per turn."""
+         stream_draft = self._stream_is_message() and self._use_draft_streaming
+-        return stream_draft or self._use_native_streaming
++        return stream_draft or self._use_native_streaming or self._use_card_streaming
+ 
+     async def _deliver_commentary(self, commentary_text: str) -> None:
+         """Post commentary as its own message.  Cumulative transports keep the stream going —
+-        resetting _accumulated would break the append-only invariant / lose text."""
++        resetting _accumulated would break the append-only invariant / lose text.
++        In card mode narration becomes the card's single ticker line (never a bubble)."""
++        if self._use_card_streaming and self._card_turn is not None:
++            self._card_turn.on_narration(commentary_text)
++            # Not forced: when the drain already rendered this tick's narration the
++            # payload signature is unchanged and no duplicate patch is sent.
++            await self._card_send_or_edit(finalize=False, force=False)
++            self._last_edit_time = time.monotonic()
++            return
+         cumulative = self._cumulative_transport()
+         if not cumulative:
+             self._reset_segment_state()
+@@ -929,6 +1432,12 @@
+         "__no_edit__" (platform never returned a real id — Signal, github_comment webhook)
+         must keep its sentinel or every tool boundary posts a new message; the
+         continuation goes out once via _send_fallback_final."""
++        if self._use_card_streaming:
++            # One card per turn: the next segment is appended under the current body
++            # with a paragraph break instead of opening a second message.
++            if self._accumulated:
++                self._card_pending_sep = True
++            return
+         if self._cumulative_transport():
+             return
+         # If the segment-break edit or send didn't land (flood control / fallback mode, or a
+@@ -944,6 +1453,11 @@
+         platforms apply formatting; is_turn_final=False because this handler owns the flags.
+         Only a successful edit confirms delivery — a partial send may be just "Let me
+         search…", not the answer."""
++        if self._use_card_streaming and self._card_turn is not None:
++            with contextlib.suppress(Exception):
++                self._card_turn.finalize()
++                if await self._card_send_or_edit(finalize=True, force=True):
++                    return
+         best_effort_ok = False
+         if self._accumulated and self._message_id:
+             with contextlib.suppress(Exception):
+--- a/plugins/platforms/feishu/adapter.py
++++ b/plugins/platforms/feishu/adapter.py
+@@ -22,6 +22,7 @@
+ import asyncio
+ import collections
+ import concurrent.futures
++import contextlib
+ import contextvars
+ import hashlib
+ import hmac
+@@ -66,6 +67,7 @@
+         "CreateFileRequest", "CreateFileRequestBody", "CreateImageRequest", "CreateImageRequestBody",
+         "CreateMessageRequest", "CreateMessageRequestBody", "GetChatRequest", "GetMessageRequest",
+         "DeleteMessageRequest", "GetMessageResourceRequest", "P2ImMessageMessageReadV1",
++        "PatchMessageRequest", "PatchMessageRequestBody",
+         "ReplyMessageRequest", "ReplyMessageRequestBody",
+         "UpdateMessageRequest", "UpdateMessageRequestBody",
+     )),
+@@ -320,6 +322,12 @@
+     allow_bots: str = "none"  # "none" | "mentions" | "all"
+     require_mention: bool = True
+     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
++    # Streaming-card replies (openclaw-feishu-patch parity): one interactive card per
++    # streamed reply, with tool progress + narration folded into a status block.
++    card_replies: bool = False
++    # CardKit 2.0 streaming transport (schema 2.0, element-level updates). Opt-in:
++    # clients older than Feishu 7.20 render a "please upgrade" block for 2.0 cards.
++    cardkit_streaming: bool = False
+ 
+ 
+ @dataclass
+@@ -1344,6 +1352,10 @@
+         self._update_prompt_counter = itertools.count(1)
+         # Reaction deletion needs the opaque reaction_id from create, cached per message_id.
+         self._pending_processing_reactions: OrderedDict[str, str] = OrderedDict()
++        # Streaming-card replies: newest live card per chat, used to fold the runtime
++        # footer into the card that was just streamed (see ``send_footer``).
++        # chat_id → {"message_id", "payload", "rendered_at", "final"}
++        self._live_stream_cards: dict[str, dict[str, Any]] = {}
+         self._load_seen_message_ids()
+ 
+     @staticmethod
+@@ -1356,6 +1368,13 @@
+ 
+         def _extra_or_secret(key: str, env: str, default: str = "") -> str:
+             return str(_shared_extra_or_secret(extra, key, env, default)).strip()
++
++        def _extra_bool(key: str, env: str, default: str = "false") -> bool:
++            """YAML booleans arrive as bool, env values as strings — accept both."""
++            raw = _shared_extra_or_secret(extra, key, env, default)
++            if isinstance(raw, bool):
++                return raw
++            return str(raw).strip().lower() in {"true", "1", "yes", "on"}
+ 
+         _extra_or_env = _extra_or_secret
+ 
+@@ -1416,6 +1435,10 @@
+             default_group_policy=str(extra.get("default_group_policy", "")).strip().lower(),
+             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
+             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
++            # ``platforms.feishu.card_replies: true`` (or FEISHU_CARD_REPLIES=1) turns
++            # streamed replies into one interactive streaming card.
++            card_replies=_extra_bool("card_replies", "FEISHU_CARD_REPLIES"),
++            cardkit_streaming=_extra_bool("cardkit_streaming", "FEISHU_CARDKIT_STREAMING"),
+         )
+ 
+     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
+@@ -1425,6 +1448,13 @@
+         self._allowed_group_users = set(settings.allowed_group_users)
+         self._admins = set(settings.admins)
+         self._default_group_policy = settings.default_group_policy or settings.group_policy
++        if getattr(self, "_card_replies", False) and not getattr(self, "_card_mode_logged", False):
++            # Startup evidence that the streaming-card patch is loaded.
++            logger.info(
++                "[Feishu] Streaming-card replies enabled: one interactive card per reply "
++                "(platforms.feishu.card_replies=true)"
++            )
++            self._card_mode_logged = True
+ 
+     def _build_event_handler(self) -> Any:
+         if EventDispatcherHandler is None:
+@@ -1652,9 +1682,34 @@
+     async def send(
+         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
+     ) -> SendResult:
+-        """Send a Feishu message."""
++        """Send a Feishu message (an interactive streaming card when card mode is on)."""
+         if not self._client:
+             return SendResult(success=False, error="Not connected")
++
++        if (getattr(self, "_cardkit_streaming", False)
++                and self._card_stream_metadata_payload(metadata) is not None):
++            cardkit_result = await self._cardkit_send(chat_id, content, reply_to, metadata)
++            if cardkit_result is not None:
++                return cardkit_result
++
++        if (isinstance(metadata, dict) and metadata.get("is_final_response")
++                and not self._card_stream_metadata_payload(metadata)):
++            folded = await self._fold_final_into_live_card(chat_id, content, metadata)
++            if folded is not None:
++                return folded
++
++        card_payload = self._stream_card_payload(content, metadata)
++        if card_payload is not None:
++            card_result = await self._send_stream_card(chat_id, card_payload, reply_to, metadata)
++            if card_result is not None:
++                return card_result
++            if not str(content or "").strip():
++                # Prewarm frame with no body: never send an empty text fallback (the
++                # stream consumer will fall back to the edit transport instead).
++                return SendResult(success=False, error="streaming card send failed")
++            # Card transport unavailable for this frame: fall through to text/post so
++            # the user still gets the content (and the consumer will downgrade).
++            logger.info("[Feishu] Streaming-card send unavailable; using text/post transport")
+ 
+         formatted = self.format_message(content)
+         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+@@ -1701,10 +1756,58 @@
+             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
+             return SendResult(success=False, error=str(exc))
+ 
+-    async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
+-        """Edit a previously sent Feishu text/post message."""
++    async def edit_message(
++        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
++        metadata: Optional[dict[str, Any]] = None,
++    ) -> SendResult:
++        """Edit a previously sent message (patches the streaming card in card mode)."""
+         if not self._client:
+             return SendResult(success=False, error="Not connected")
++
++        if getattr(self, "_cardkit_streaming", False):
++            ck_state = self._cardkit_state_for(chat_id, message_id)
++            if ck_state is not None:
++                payload = self._stream_card_payload(content, metadata, finalize=finalize)
++                if payload is None:
++                    payload = {**dict(ck_state.get("payload") or {}), "body": str(content or ""),
++                               "final": bool(finalize)}
++                return await self._cardkit_edit(chat_id, ck_state, payload, finalize=finalize)
++
++        card_payload = self._stream_card_payload(content, metadata, finalize=finalize)
++        if card_payload is not None:
++            card_result = await self._patch_stream_card(
++                chat_id, message_id, card_payload, metadata, finalize=finalize,
++            )
++            if card_result is not None:
++                return card_result
++            if self._is_live_card_message(message_id):
++                # The target is one of our interactive cards: a text/post update can
++                # never succeed (Feishu 230001). Fail fast so the consumer downgrades
++                # instead of burning a doomed API call.
++                logger.warning("[Feishu] Card patch failed for a known live card %s", message_id)
++                return SendResult(success=False, error="streaming card patch failed")
++            # Not a card target: fall back to the text/post update path below; the
++            # consumer downgrades if that fails too.
++            logger.info("[Feishu] Card patch unavailable for %s; using text/post update", message_id)
++
++        if card_payload is None and finalize and str(content or "").strip():
++            # Stale-finalize / transformed-final reconciliation calls edit_message with
++            # the complete answer but no card metadata. If the target is our live card,
++            # fold the answer into the card instead of PUT-ing text at an interactive
++            # message (Feishu 230054) and then sending a duplicate final card.
++            live = self._live_card_for(chat_id)
++            if live and str(live.get("message_id") or "") == str(message_id):
++                from plugins.platforms.feishu import card_stream as _cs
++                payload = {**dict(live.get("payload") or {}),
++                           "body": str(content), "final": True, "status": "",
++                           "template": _cs.HEADER_TEMPLATE_FINAL}
++                card_result = await self._patch_stream_card(
++                    chat_id, message_id, payload, metadata, finalize=True,
++                )
++                if card_result is not None:
++                    if card_result.success:
++                        logger.info("[Feishu] Folded final response into streaming card %s", message_id)
++                    return card_result
+ 
+         content = self.format_message(content)
+ 
+@@ -1747,6 +1850,495 @@
+             logger.debug("[Feishu] Failed to delete message %s", message_id, exc_info=True)
+             return False
+ 
++    # --- Streaming-card replies (openclaw-feishu-patch parity) ------------------------------
++    #
++    # When ``platforms.feishu.card_replies`` is on, the gateway stream consumer's first
++    # frame (``metadata.expect_edits=True``) is sent as one interactive card and every
++    # later frame patches that same card in place.  The card payload is carried in
++    # ``metadata["hermes_card_stream"]``; it holds the answer body, the compact status
++    # block (tool progress / narration), and the final runtime-footer note.  A non-
++    # streamed final response (``metadata.is_final_response``) is also rendered as a
++    # finished card so a turn keeps one tidy card even when streaming is unavailable.
++
++    def supports_card_streaming(
++        self, chat_id: Optional[str] = None, *, chat_type: Optional[str] = None,
++        metadata: Optional[dict[str, Any]] = None,
++    ) -> bool:
++        """Gateway stream-consumer probe: card transport available for this chat."""
++        return bool(getattr(self, "_card_replies", False)) and self._client is not None
++
++    def stream_is_message_for_chat(self, chat_id: str) -> bool:
++        """Card mode streams into ONE message: tool/segment boundaries must not split it."""
++        return bool(getattr(self, "_card_replies", False))
++
++    def _card_title_text(self) -> str:
++        from plugins.platforms.feishu.card_stream import DEFAULT_TITLE
++        return str(getattr(self, "_bot_name", "") or "").strip() or DEFAULT_TITLE
++
++    @staticmethod
++    def _card_stream_metadata_payload(metadata: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
++        if not isinstance(metadata, dict):
++            return None
++        from plugins.platforms.feishu.card_stream import CARD_STREAM_METADATA_KEY
++        payload = metadata.get(CARD_STREAM_METADATA_KEY)
++        return payload if isinstance(payload, dict) else None
++
++    def _stream_card_payload(
++        self, content: str, metadata: Optional[dict[str, Any]], *, finalize: bool = False,
++    ) -> Optional[dict[str, Any]]:
++        """Card payload for this send/edit, or None to use the text/post transport."""
++        if not bool(getattr(self, "_card_replies", False)):
++            return None  # avoid the card_stream import on every send for non-card configs
++        from plugins.platforms.feishu import card_stream as _cs
++        payload = self._card_stream_metadata_payload(metadata)
++        if payload is not None:
++            if finalize and not payload.get("final"):
++                payload = {
++                    **payload,
++                    "final": True,
++                    "status": "",
++                    "body": payload.get("body") or str(content or ""),
++                }
++            return payload
++        if not isinstance(metadata, dict) or not metadata.get("is_final_response"):
++            return None
++        # Non-streamed final: one finished card instead of one or more text bubbles.
++        footer = str(metadata.get("runtime_footer") or "").strip()
++        body = str(content or "")
++        if footer and body.rstrip().endswith(footer):
++            body = body.rstrip()[: -len(footer)].rstrip()
++        # Never render raw MEDIA:<path> directives inside the card; the gateway delivers
++        # attachments separately (same rule as the streaming transport's display text).
++        try:
++            body = self.strip_media_directives_for_display(body)
++        except Exception:
++            pass
++        if len(body) > _cs.CARD_BODY_MAX_CHARS:
++            # Too long for one bounded card: use the chunked text/post transport instead
++            # (no silent truncation; the card budget is only for the streaming path,
++            # where the consumer sends the overflow as continuation messages).
++            logger.info("[Feishu] Final response exceeds the card body budget; sending as text")
++            return None
++        return {
++            "schema": _cs.CARD_SCHEMA_VERSION,
++            "title": self._card_title_text(),
++            "body": body,
++            "status": "",
++            "footer": footer,
++            "final": True,
++            "template": _cs.HEADER_TEMPLATE_FINAL,
++        }
++
++    async def _fold_final_into_live_card(
++        self, chat_id: str, content: str, metadata: Optional[dict[str, Any]],
++    ) -> Optional[SendResult]:
++        """Fold a normal-lane final fallback into the still-open streaming card.
++
++        Normally the stream consumer suppresses this send. When finalization failed (or
++        the turn failed before a final frame), the gateway falls back to the normal final
++        send; folding it into the existing card keeps ONE reply and turns a provider
++        failure into an error card instead of a loose text bubble + half-written card.
++        """
++        if not bool(getattr(self, "_card_replies", False)) or not self._client:
++            return None
++        from plugins.platforms.feishu import card_stream as _cs
++        if not isinstance(metadata, dict) or metadata.get(_cs.CARD_STREAM_METADATA_KEY):
++            return None
++        live = self._live_card_for(chat_id)
++        message_id = str((live or {}).get("message_id") or "")
++        payload = dict((live or {}).get("payload") or {})
++        if not message_id or not payload or bool(payload.get("final")):
++            return None
++        try:
++            body = self.strip_media_directives_for_display(str(content or ""))
++        except Exception:
++            body = str(content or "")
++        footer = str(metadata.get("runtime_footer") or "").strip()
++        if footer and body.rstrip().endswith(footer):
++            body = body.rstrip()[: -len(footer)].rstrip()
++        body = body.strip()
++        if not body:
++            return None
++        if len(body) > _cs.CARD_BODY_MAX_CHARS:
++            # A fresh final send will chunk the full text; remove the half-written card
++            # so the chat never shows a partial answer plus its complete text copy.
++            with contextlib.suppress(Exception):
++                await self.delete_message(chat_id, message_id)
++            with contextlib.suppress(Exception):
++                (getattr(self, "_live_stream_cards", {}) or {}).pop(str(chat_id), None)
++            return None
++        errorish = body.startswith(("⚠️", "❌", "⛔")) or "provider temporarily unavailable" in body.lower()
++        payload.update({
++            "body": body,
++            "status": "",
++            "notice": "",
++            "final": True,
++            "template": _cs.HEADER_TEMPLATE_ERROR if errorish else _cs.HEADER_TEMPLATE_FINAL,
++        })
++        if footer:
++            payload["footer"] = footer
++        if errorish:
++            payload["stats"] = {}
++        result = await self._patch_stream_card(chat_id, message_id, payload, metadata, finalize=True)
++        if result is not None and result.success:
++            logger.info("[Feishu] Folded final fallback into streaming card %s", message_id)
++            return result
++        # Patch failed: recall the partial card so the normal final send is the only copy.
++        with contextlib.suppress(Exception):
++            await self.delete_message(chat_id, message_id)
++        with contextlib.suppress(Exception):
++            (getattr(self, "_live_stream_cards", {}) or {}).pop(str(chat_id), None)
++        logger.warning("[Feishu] Final fallback fold failed for %s; recalled the partial card", message_id)
++        return None
++
++    # ── CardKit 2.0 transport (optional; schema 2.0 + element updates) ──────────
++
++    def _cardkit_state_for(self, chat_id: str, message_id: str = "") -> Optional[dict[str, Any]]:
++        cards = getattr(self, "_cardkit_cards", None)
++        state = cards.get(str(chat_id)) if isinstance(cards, dict) else None
++        if not state:
++            return None
++        if message_id and str(message_id) not in {
++            str(state.get("message_id") or ""), str(state.get("card_id") or ""),
++        }:
++            return None
++        return state
++
++    @staticmethod
++    def _cardkit_id(state: dict[str, Any], prefix: str) -> str:
++        state["sequence"] = int(state.get("sequence") or 0) + 1
++        return f"{prefix}_{state['sequence']}"
++
++    async def _cardkit_send(
++        self, chat_id: str, content: str, reply_to: Optional[str],
++        metadata: Optional[dict[str, Any]],
++    ) -> Optional[SendResult]:
++        """Create a CardKit 2.0 entity, send it, and track it for element updates."""
++        payload = self._card_stream_metadata_payload(metadata)
++        if payload is None:
++            return None
++        from plugins.platforms.feishu import cardkit_v2 as _ck
++        try:
++            from lark_oapi.api.cardkit.v1 import (
++                CreateCardRequest, CreateCardRequestBody,
++            )
++            from lark_oapi.api.cardkit.v1.model import Card as _CkCard
++            card = _ck.build_card_v2(payload, title_fallback=self._card_title_text())
++            body = CreateCardRequestBody.builder().type("card_json").data(
++                json.dumps(card, ensure_ascii=False)).build()
++            request = CreateCardRequest.builder().request_body(body).build()
++            response = await self._run_blocking(self._client.cardkit.v1.card.create, request)
++            if not self._response_succeeded(response):
++                logger.warning("[Feishu] CardKit create failed: %s", getattr(response, "msg", "?"))
++                from plugins.platforms.feishu import card_stream as _cs
++                _cs.record_card_event("cardkit_create_failed", error=str(getattr(response, "msg", ""))[:120])
++                return None
++            card_id = str(getattr(getattr(response, "data", None), "card_id", "") or "")
++            if not card_id:
++                return None
++            content_json = json.dumps({"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False)
++            sent = await self._feishu_send_with_retry(
++                chat_id=chat_id, msg_type="interactive", payload=content_json,
++                reply_to=reply_to, metadata=metadata,
++            )
++            if not self._response_succeeded(sent):
++                logger.warning("[Feishu] CardKit message send failed: %s", getattr(sent, "msg", "?"))
++                return None
++            message_id = str(getattr(getattr(sent, "data", None), "message_id", "") or "")
++            state = {"card_id": card_id, "message_id": message_id, "sequence": 1,
++                     "payload": dict(payload),
++                     "has_content": bool(str(payload.get("body") or "").strip())}
++            cards = getattr(self, "_cardkit_cards", None)
++            if not isinstance(cards, dict):
++                cards = {}
++                self._cardkit_cards = cards
++            cards[str(chat_id)] = state
++            from plugins.platforms.feishu import card_stream as _cs
++            _cs.record_card_event("cardkit_send_ok")
++            return SendResult(success=True, message_id=message_id or card_id)
++        except Exception as exc:
++            logger.warning("[Feishu] CardKit send failed: %s", exc, exc_info=True)
++            return None
++
++    async def _cardkit_element_content(
++        self, state: dict[str, Any], element_id: str, text: str,
++    ) -> bool:
++        from lark_oapi.api.cardkit.v1 import ContentCardElementRequest, ContentCardElementRequestBody
++        try:
++            body = (ContentCardElementRequestBody.builder()
++                    .content(str(text or "\u200b"))
++                    .sequence(int(state.get("sequence") or 0) + 1)
++                    .uuid(self._cardkit_id(state, f"el_{element_id}"))
++                    .build())
++            request = (ContentCardElementRequest.builder()
++                       .card_id(str(state["card_id"])).element_id(element_id)
++                       .request_body(body).build())
++            response = await self._run_blocking(self._client.cardkit.v1.card_element.content, request)
++            return bool(self._response_succeeded(response))
++        except Exception as exc:
++            logger.debug("[Feishu] CardKit element update %s failed: %s", element_id, exc)
++            return False
++
++    async def _cardkit_close(self, state: dict[str, Any], summary: str) -> bool:
++        from lark_oapi.api.cardkit.v1 import SettingsCardRequest, SettingsCardRequestBody
++        try:
++            settings = json.dumps({"config": {"streaming_mode": False,
++                                              "summary": {"content": (summary or "✅ 已回复")[:50]}}},
++                                  ensure_ascii=False)
++            body = (SettingsCardRequestBody.builder().settings(settings)
++                    .sequence(int(state.get("sequence") or 0) + 1)
++                    .uuid(self._cardkit_id(state, "close")).build())
++            request = (SettingsCardRequest.builder().card_id(str(state["card_id"]))
++                       .request_body(body).build())
++            response = await self._run_blocking(self._client.cardkit.v1.card.settings, request)
++            return bool(self._response_succeeded(response))
++        except Exception as exc:
++            logger.debug("[Feishu] CardKit close failed: %s", exc)
++            return False
++
++    async def _cardkit_full_update(self, state: dict[str, Any], payload: dict[str, Any]) -> bool:
++        from lark_oapi.api.cardkit.v1 import UpdateCardRequest, UpdateCardRequestBody
++        from lark_oapi.api.cardkit.v1.model import Card as _CkCard
++        from plugins.platforms.feishu import cardkit_v2 as _ck
++        try:
++            card = _ck.build_card_v2(payload, title_fallback=self._card_title_text())
++            card_obj = _CkCard.builder().type("card_json").data(
++                json.dumps(card, ensure_ascii=False)).build()
++            body = (UpdateCardRequestBody.builder().card(card_obj)
++                    .sequence(int(state.get("sequence") or 0) + 1)
++                    .uuid(self._cardkit_id(state, "card")).build())
++            request = (UpdateCardRequest.builder().card_id(str(state["card_id"]))
++                       .request_body(body).build())
++            response = await self._run_blocking(self._client.cardkit.v1.card.update, request)
++            return bool(self._response_succeeded(response))
++        except Exception as exc:
++            logger.debug("[Feishu] CardKit full update failed: %s", exc)
++            return False
++
++    async def _cardkit_append_content(self, state: dict[str, Any], body: str) -> bool:
++        """Append the content markdown element once the first answer text arrives."""
++        from lark_oapi.api.cardkit.v1 import CreateCardElementRequest, CreateCardElementRequestBody
++        from plugins.platforms.feishu import cardkit_v2 as _ck
++        try:
++            elements = json.dumps([_ck._markdown("content", body)], ensure_ascii=False)
++            request_body = (CreateCardElementRequestBody.builder()
++                            .type("append")
++                            .elements(elements)
++                            .sequence(int(state.get("sequence") or 0) + 1)
++                            .uuid(self._cardkit_id(state, "add_content")).build())
++            request = (CreateCardElementRequest.builder()
++                       .card_id(str(state["card_id"])).request_body(request_body).build())
++            response = await self._run_blocking(self._client.cardkit.v1.card_element.create, request)
++            return bool(self._response_succeeded(response))
++        except Exception as exc:
++            logger.debug("[Feishu] CardKit append content failed: %s", exc)
++            return False
++
++    async def _cardkit_edit(
++        self, chat_id: str, state: dict[str, Any], payload: dict[str, Any], *, finalize: bool,
++    ) -> SendResult:
++        from plugins.platforms.feishu import cardkit_v2 as _ck
++        from plugins.platforms.feishu import card_stream as _cs
++        try:
++            if finalize:
++                await self._cardkit_close(state, str(payload.get("chat_summary") or ""))
++                ok = await self._cardkit_full_update(state, {**payload, "final": True})
++                if ok:
++                    state["payload"] = {**payload, "final": True}
++                    _cs.record_card_event("cardkit_final_ok")
++                    return SendResult(success=True, message_id=str(state.get("message_id") or ""))
++                _cs.record_card_event("cardkit_final_failed")
++                return SendResult(success=False, error="cardkit final update failed")
++            status = str(payload.get("status") or payload.get("notice") or "").strip()
++            ok_status = True
++            if status:
++                ok_status = await self._cardkit_element_content(
++                    state, "status", _ck.status_markdown(status),
++                )
++            body = _ck._body_markdown_without_tables(str(payload.get("body") or ""))
++            ok_body = True
++            if body:
++                if not state.get("has_content"):
++                    ok_body = await self._cardkit_append_content(state, body)
++                    if ok_body:
++                        state["has_content"] = True
++                else:
++                    ok_body = await self._cardkit_element_content(state, "content", body)
++            if ok_status and ok_body:
++                state["payload"] = dict(payload)
++                _cs.record_card_event("cardkit_patch_ok")
++                return SendResult(success=True, message_id=str(state.get("message_id") or ""))
++            _cs.record_card_event("cardkit_patch_failed")
++            return SendResult(success=False, error="cardkit element update failed")
++        except Exception as exc:
++            logger.warning("[Feishu] CardKit edit failed: %s", exc)
++            return SendResult(success=False, error=str(exc))
++
++    def _build_stream_card_json(self, payload: dict[str, Any]) -> Optional[str]:
++        from plugins.platforms.feishu import card_stream as _cs
++        try:
++            card_json = _cs.build_card_json(payload, title_fallback=self._card_title_text())
++        except Exception:
++            logger.warning("[Feishu] Failed to build streaming card JSON", exc_info=True)
++            return None
++        if _cs.card_json_too_large(card_json):
++            logger.warning(
++                "[Feishu] Streaming card JSON exceeds %d bytes; falling back to text/post",
++                _cs.CARD_JSON_MAX_BYTES,
++            )
++            return None
++        return card_json
++
++    def _remember_live_card(self, chat_id: str, message_id: str, payload: dict[str, Any]) -> None:
++        """Track the newest streaming card per chat so the footer can be folded into it."""
++        if not chat_id or not message_id:
++            return
++        cache = getattr(self, "_live_stream_cards", None)
++        if not isinstance(cache, dict):
++            cache = {}
++            self._live_stream_cards = cache
++        cache[str(chat_id)] = {
++            "message_id": str(message_id),
++            "payload": dict(payload or {}),
++            "rendered_at": time.time(),
++            "final": bool((payload or {}).get("final")),
++        }
++        while len(cache) > 64:  # bounded: one card per chat, oldest chats evicted
++            cache.pop(next(iter(cache)), None)
++
++    def _live_card_for(self, chat_id: str) -> Optional[dict[str, Any]]:
++        cache = getattr(self, "_live_stream_cards", None)
++        return cache.get(str(chat_id)) if isinstance(cache, dict) else None
++
++    def _is_live_card_message(self, message_id: str) -> bool:
++        """True when ``message_id`` is one of this adapter's streaming cards."""
++        cache = getattr(self, "_live_stream_cards", None)
++        if not isinstance(cache, dict) or not message_id:
++            return False
++        return any(str(entry.get("message_id") or "") == str(message_id) for entry in cache.values())
++
++    async def _send_stream_card(
++        self, chat_id: str, payload: dict[str, Any], reply_to: Optional[str],
++        metadata: Optional[dict[str, Any]],
++    ) -> Optional[SendResult]:
++        """Create the streaming card; None → caller falls back to text/post."""
++        card_json = self._build_stream_card_json(payload)
++        if card_json is None:
++            return None
++        try:
++            response = await self._feishu_send_with_retry(
++                chat_id=chat_id, msg_type="interactive", payload=card_json, reply_to=reply_to, metadata=metadata,
++            )
++        except Exception as exc:
++            logger.warning("[Feishu] Streaming-card send failed: %s", exc)
++            return None
++        result = self._finalize_send_result(response, "streaming card send failed")
++        if not result.success:
++            logger.warning("[Feishu] Streaming-card send rejected: %s", result.error)
++            from plugins.platforms.feishu import card_stream as _cs
++            _cs.record_card_event("card_send_failed", error=str(result.error or "")[:120])
++            return None
++        if result.message_id:
++            self._remember_live_card(chat_id, result.message_id, payload)
++            from plugins.platforms.feishu import card_stream as _cs
++            _cs.record_card_event("card_send_ok")
++        return result
++
++    async def _patch_stream_card(
++        self, chat_id: str, message_id: str, payload: dict[str, Any],
++        metadata: Optional[dict[str, Any]], *, finalize: bool = False,
++    ) -> Optional[SendResult]:
++        """Patch the live card; None → caller falls back to its text/post path.
++
++        Feishu's per-message update frequency limit (230020) is transient: retry with
++        exponential backoff instead of tearing the card transport down for the turn.
++        A definitive failure returns ``SendResult(success=False, ...)`` so the consumer
++        can see the reason (and retry/defer rather than blindly downgrade).
++        """
++        if not message_id:
++            return None
++        card_json = self._build_stream_card_json(payload)
++        if card_json is None:
++            return None
++        last_error = ""
++        last_response = None
++        attempts = 3
++        for attempt in (1, 2, 3):
++            try:
++                request = self._build_patch_message_request(
++                    message_id=message_id,
++                    request_body=self._build_patch_message_body(content=card_json),
++                )
++                response = await self._run_blocking(self._client.im.v1.message.patch, request)
++                last_response = response
++            except Exception as exc:
++                last_error = str(exc)
++                logger.warning("[Feishu] Streaming-card patch attempt %d raised: %s", attempt, exc)
++                if attempt < attempts:
++                    await asyncio.sleep(0.6 * attempt)
++                continue
++            if self._response_succeeded(response):
++                result = SendResult(success=True, message_id=message_id, raw_response=response)
++                self._remember_live_card(chat_id, message_id, payload)
++                from plugins.platforms.feishu import card_stream as _cs
++                _cs.record_card_event("card_patch_ok", final=bool(finalize))
++                return result
++            last_error = f"[{getattr(response, 'code', '?')}] {getattr(response, 'msg', 'patch failed')}"
++            limited = "230020" in last_error or "frequency limit" in last_error.lower() \
++                or "too frequently" in last_error.lower()
++            if limited:
++                logger.warning(
++                    "[Feishu] Streaming-card patch rate-limited (attempt %d/%d): %s",
++                    attempt, attempts, last_error,
++                )
++                from plugins.platforms.feishu import card_stream as _cs
++                _cs.record_card_event("card_patch_rate_limited", final=bool(finalize), attempt=attempt)
++                if attempt < attempts:
++                    await asyncio.sleep(1.2 * attempt)
++                continue
++            if attempt == 1:
++                await asyncio.sleep(0.4)
++        logger.warning("[Feishu] Streaming-card patch failed for %s: %s", message_id, last_error)
++        from plugins.platforms.feishu import card_stream as _cs
++        _cs.record_card_event("card_patch_failed", final=bool(finalize), error=str(last_error)[:120])
++        return SendResult(success=False, error=last_error, raw_response=last_response)
++
++    async def send_footer(
++        self, chat_id: str, footer: str, metadata: Optional[dict[str, Any]] = None, *,
++        reply_to: Optional[str] = None,
++    ) -> SendResult:
++        """Fold the runtime footer into the streaming card it belongs to.
++
++        Streaming hands the answer body over before the usage numbers are known, so the
++        gateway sends the footer afterwards.  Patching it into the live card's note keeps
++        the reply as ONE card; without a live card it is an ordinary trailing message.
++        """
++        footer = str(footer or "").strip()
++        if not footer:
++            return SendResult(success=True)
++        if getattr(self, "_cardkit_streaming", False):
++            ck_state = self._cardkit_state_for(chat_id)
++            if ck_state is not None:
++                payload = {**dict(ck_state.get("payload") or {}), "footer": footer, "final": True}
++                ok = await self._cardkit_full_update(ck_state, payload)
++                if ok:
++                    ck_state["payload"] = payload
++                    return SendResult(success=True, message_id=str(ck_state.get("message_id") or ""))
++                logger.warning("[Feishu] CardKit footer update failed; sending as text")
++        if self._client and bool(getattr(self, "_card_replies", False)):
++            live = self._live_card_for(chat_id)
++            message_id = str((live or {}).get("message_id") or "")
++            if live and message_id:
++                payload = {**dict(live.get("payload") or {})}
++                payload.update({"footer": footer, "final": True, "status": ""})
++                result = await self._patch_stream_card(
++                    chat_id, message_id, payload, metadata, finalize=True,
++                )
++                if result is not None and result.success:
++                    return result
++                logger.warning("[Feishu] Footer fold into streaming card failed; sending as text")
++        return await self.send(chat_id, footer, reply_to=reply_to, metadata=metadata)
++
+     # Template attrs for the shared _format_exec_approval core. The card
+     # header carries the title, so the text core starts at the code fence.
+     _EA_HEADER = ""
+@@ -1770,6 +2362,263 @@
+                 "always": "✅ " + t("platform.feishu.approval.action_always"),
+                 "deny": "❌ " + t("gateway.exec_approval.action_deny")}
+     _EA_CARD_ACTIONS = {"once": "approve_once", "session": "approve_session", "always": "approve_always", "deny": "deny"}
++
++    # ── clarify prompts (button card; keeps progress inside cards) ──────────────
++
++    @staticmethod
++    def _clarify_card_markdown(question: str, *, multi_select: bool = False) -> str:
++        hint = ("可多选：点选选项后再点“提交”；也可以直接回复编号。"
++                if multi_select else "点下面的按钮选择；也可以直接回复编号。")
++        return f"**{question}**\n\n{hint}"
++
++    @staticmethod
++    def _build_clarify_card(
++        *, question: str, choices: list[str], clarify_id: str,
++        multi_select: bool = False, selected: Optional[list[str]] = None,
++    ) -> dict[str, Any]:
++        from tools.clarify_tool import strip_recommended
++        chosen = [str(x) for x in (selected or [])]
++        actions = []
++        for index, choice in enumerate(list(choices)[:8]):
++            label = strip_recommended(str(choice)) or str(choice)
++            if multi_select:
++                mark = "✅ " if str(choice) in chosen else "○ "
++                actions.append(_card_button(
++                    mark + label, "primary" if str(choice) in chosen else "default",
++                    {"hermes_clarify_action": "toggle", "clarify_id": str(clarify_id), "answer": str(choice)},
++                ))
++            else:
++                actions.append(_card_button(
++                    label, "primary" if index == 0 else "default",
++                    {"hermes_clarify_action": "choice", "clarify_id": str(clarify_id), "answer": str(choice)},
++                ))
++        if multi_select:
++            actions.append(_card_button(
++                f"✅ 提交（{len(chosen)}）" if chosen else "✅ 提交", "primary",
++                {"hermes_clarify_action": "submit", "clarify_id": str(clarify_id)},
++            ))
++        actions.append(_card_button(
++            "✏️ 其他", "default", {"hermes_clarify_action": "other", "clarify_id": str(clarify_id)},
++        ))
++        actions.append(_card_button(
++            "⏭️ 跳过", "danger",
++            {"hermes_clarify_action": "choice", "clarify_id": str(clarify_id), "answer": "skip"},
++        ))
++        title = "❓ 需要你确认（可多选）" if multi_select else "❓ 需要你确认"
++        return _card(title, "orange",
++                     FeishuAdapter._clarify_card_markdown(question, multi_select=multi_select), actions=actions)
++
++    async def send_clarify(
++        self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
++        session_key: str, metadata: Optional[dict[str, Any]] = None,
++    ) -> SendResult:
++        """Clarify prompt as an interactive card instead of a plain text bubble.
++
++        Multiple-choice prompts get one button per choice + Other + Skip; open-ended
++        prompts (and multi-select prompts) get a card telling the user to type the
++        answer, which the gateway's existing text intercept still resolves.
++        """
++        if not self._client:
++            return SendResult(success=False, error="Not connected")
++        try:
++            from tools.clarify_gateway import get_pending
++            entry = get_pending(clarify_id)
++            multi_select = bool(getattr(entry, "multi_select", False))
++            choice_list = [str(c) for c in (choices or []) if str(c).strip()]
++            if choice_list:
++                card = self._build_clarify_card(
++                    question=question, choices=choice_list, clarify_id=clarify_id,
++                    multi_select=multi_select,
++                )
++                state_map = getattr(self, "_clarify_state", None)
++                if not isinstance(state_map, dict):
++                    state_map = {}
++                    self._clarify_state = state_map
++                result = await self._send_interactive_card(
++                    chat_id, card, metadata, "send_clarify failed",
++                    state_map=state_map, state_id=str(clarify_id), session_key=session_key,
++                )
++                if result.success:
++                    state_map.setdefault(str(clarify_id), {}).update({
++                        "question": str(question), "choices": choice_list,
++                        "multi_select": bool(multi_select), "selected": [],
++                    })
++                return result
++            card = _card("❓ 需要你回答", "orange",
++                         FeishuAdapter._clarify_card_markdown(question, multi_select=multi_select))
++            response = await self._feishu_send_with_retry(
++                chat_id=chat_id, msg_type="interactive",
++                payload=json.dumps(card, ensure_ascii=False), reply_to=None, metadata=metadata,
++            )
++            return self._finalize_send_result(response, "send_clarify failed")
++        except Exception as exc:
++            logger.warning("[Feishu] send_clarify failed: %s", exc)
++            return SendResult(success=False, error=str(exc))
++
++    def _handle_clarify_card_action(self, *, event: Any, action_value: dict[str, Any]) -> Any:
++        """Resolve/toggle a clarify choice inline (no extra bubble, no stale buttons)."""
++        from tools.clarify_gateway import resolve_gateway_clarify, mark_awaiting_text
++        clarify_id = str(action_value.get("clarify_id") or "")
++        state_map = getattr(self, "_clarify_state", None)
++        state = state_map.get(clarify_id) if isinstance(state_map, dict) else None
++        if not clarify_id or not state:
++            logger.debug("[Feishu] Clarify %s already resolved or unknown", clarify_id)
++            return self._card_response()
++        checked = self._validate_card_action(event=event, state=state, label="clarify", ident=clarify_id)
++        if checked is None:
++            return self._card_response()
++        question = str(state.get("question") or "")
++        choices = [str(c) for c in (state.get("choices") or [])]
++        multi = bool(state.get("multi_select"))
++        selected = list(state.get("selected") or [])
++        action = action_value.get("hermes_clarify_action")
++        if action == "toggle" and multi:
++            answer = str(action_value.get("answer") or "")
++            if answer in selected:
++                selected.remove(answer)
++            elif answer:
++                selected.append(answer)
++            state["selected"] = selected
++            return self._card_response(self._build_clarify_card(
++                question=question, choices=choices, clarify_id=clarify_id,
++                multi_select=True, selected=selected,
++            ))
++        if action == "submit" and multi:
++            if not selected:
++                return self._card_response(self._build_clarify_card(
++                    question=question, choices=choices, clarify_id=clarify_id,
++                    multi_select=True, selected=selected,
++                ))
++            answer = json.dumps(selected, ensure_ascii=False)
++            resolved = resolve_gateway_clarify(clarify_id, answer)
++            with contextlib.suppress(Exception):
++                state_map.pop(clarify_id, None)
++            if not resolved:
++                return self._card_response(_card(
++                    "⚠️ 已失效", "red", f"**{question}**\n\n该问题已被回答或超时。",
++                ))
++            return self._card_response(_card(
++                "✅ 已选择", "green", f"**{question}**\n\n已选择：{'、'.join(selected)}",
++            ))
++        if action == "other":
++            mark_awaiting_text(clarify_id)
++            with contextlib.suppress(Exception):
++                state_map.pop(clarify_id, None)
++            return self._card_response(_card(
++                "✏️ 请直接回复", "orange",
++                f"**{question}**\n\n请直接输入你的答案（不用带编号）。",
++            ))
++        answer = str(action_value.get("answer") or "")
++        resolved = resolve_gateway_clarify(clarify_id, answer)
++        with contextlib.suppress(Exception):
++            state_map.pop(clarify_id, None)
++        if not resolved:
++            return self._card_response(_card(
++                "⚠️ 已失效", "red", f"**{question}**\n\n该问题已被回答或超时。",
++            ))
++        shown = "跳过" if answer.strip().casefold() == "skip" else answer
++        return self._card_response(_card(
++            "✅ 已选择", "green", f"**{question}**\n\n已选择：{shown}",
++        ))
++
++    async def _patch_card_json(self, message_id: str, card: dict[str, Any]) -> bool:
++        try:
++            request = self._build_patch_message_request(
++                message_id=message_id,
++                request_body=self._build_patch_message_body(
++                    content=json.dumps(card, ensure_ascii=False),
++                ),
++            )
++            response = await self._run_blocking(self._client.im.v1.message.patch, request)
++            return self._response_succeeded(response)
++        except Exception as exc:
++            logger.debug("[Feishu] Clarify card retire failed: %s", exc)
++            return False
++
++    async def retire_clarify_card(self, clarify_id: str, notice: str = "") -> bool:
++        """Replace a stale clarify card's buttons once the prompt ends without a click."""
++        state_map = getattr(self, "_clarify_state", None)
++        state = state_map.pop(str(clarify_id), None) if isinstance(state_map, dict) else None
++        message_id = str((state or {}).get("message_id") or "")
++        if not state or not message_id:
++            return False
++        question = str(state.get("question") or "")
++        text = f"**{question}**\n\n{notice or '此问题已结束。'}"
++        return await self._patch_card_json(message_id, _card("✅ 已处理", "green", text))
++
++    async def send_slash_confirm(
++        self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str,
++        metadata: Optional[dict[str, Any]] = None,
++    ) -> SendResult:
++        """Approve Once / Always Approve / Cancel buttons for destructive slash commands."""
++        if not self._client:
++            return SendResult(success=False, error="Not connected")
++        try:
++            actions = [
++                _card_button("✅ 仅本次", "primary",
++                             {"hermes_slash_confirm": "once", "confirm_id": str(confirm_id),
++                              "session_key": session_key}),
++                _card_button("🔁 总是允许", "default",
++                             {"hermes_slash_confirm": "always", "confirm_id": str(confirm_id),
++                              "session_key": session_key}),
++                _card_button("❌ 取消", "danger",
++                             {"hermes_slash_confirm": "cancel", "confirm_id": str(confirm_id),
++                              "session_key": session_key}),
++            ]
++            card = _card(f"⚠️ {title or '需要确认'}", "orange", str(message or ""), actions=actions)
++            state_map = getattr(self, "_slash_confirm_state", None)
++            if not isinstance(state_map, dict):
++                state_map = {}
++                self._slash_confirm_state = state_map
++            result = await self._send_interactive_card(
++                chat_id, card, metadata, "send_slash_confirm failed",
++                state_map=state_map, state_id=str(confirm_id), session_key=session_key,
++            )
++            if result.success:
++                state_map.setdefault(str(confirm_id), {}).update({
++                    "session_key": session_key, "confirm_id": str(confirm_id),
++                })
++            return result
++        except Exception as exc:
++            logger.warning("[Feishu] send_slash_confirm failed: %s", exc)
++            return SendResult(success=False, error=str(exc))
++
++    async def _resolve_slash_confirm_card(
++        self, *, session_key: str, confirm_id: str, choice: str, chat_id: str,
++    ) -> None:
++        from tools import slash_confirm
++        try:
++            text = await slash_confirm.resolve(session_key, confirm_id, choice)
++        except Exception as exc:
++            logger.error("[Feishu] slash_confirm.resolve failed: %s", exc, exc_info=True)
++            return
++        if text:
++            with contextlib.suppress(Exception):
++                await self.send(chat_id, text)
++
++    def _handle_slash_confirm_card_action(
++        self, *, event: Any, action_value: dict[str, Any], loop: Any,
++    ) -> Any:
++        confirm_id = str(action_value.get("confirm_id") or "")
++        choice = str(action_value.get("hermes_slash_confirm") or "")
++        state_map = getattr(self, "_slash_confirm_state", None)
++        state = state_map.get(confirm_id) if isinstance(state_map, dict) else None
++        if not confirm_id or choice not in {"once", "always", "cancel"} or not state:
++            logger.debug("[Feishu] Slash confirm %s already resolved or unknown", confirm_id)
++            return self._card_response()
++        checked = self._validate_card_action(event=event, state=state, label="slash confirm", ident=confirm_id)
++        if checked is None:
++            return self._card_response()
++        state_map.pop(confirm_id, None)
++        session_key = str(state.get("session_key") or action_value.get("session_key") or "")
++        coro = self._resolve_slash_confirm_card(
++            session_key=session_key, confirm_id=confirm_id, choice=choice,
++            chat_id=str(state.get("chat_id") or ""),
++        )
++        if not self._submit_on_loop(loop, coro):
++            return self._card_response()
++        label = {"once": "已允许本次", "always": "已允许并记住", "cancel": "已取消"}[choice]
++        return self._card_response(_card("✅ 已处理", "green", f"**{label}**"))
+ 
+     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
+         """Approval-button card; ``hermes_action`` in each button value lets the click callback
+@@ -2202,6 +3051,10 @@
+         action = getattr(event, "action", None)
+         action_value = getattr(action, "value", {}) or {}
+         if isinstance(action_value, dict):
++            if action_value.get("hermes_clarify_action"):
++                return self._handle_clarify_card_action(event=event, action_value=action_value)
++            if action_value.get("hermes_slash_confirm"):
++                return self._handle_slash_confirm_card_action(event=event, action_value=action_value, loop=loop)
+             if action_value.get("hermes_action"):
+                 return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
+             if action_value.get("hermes_update_prompt_action"):
+@@ -4015,6 +4868,14 @@
+         return _sdk_build(UpdateMessageRequest, message_id=message_id, request_body=request_body)
+ 
+     @staticmethod
++    def _build_patch_message_body(*, content: str) -> Any:
++        return _sdk_build(PatchMessageRequestBody, content=content)
++
++    @staticmethod
++    def _build_patch_message_request(message_id: str, request_body: Any) -> Any:
++        return _sdk_build(PatchMessageRequest, message_id=message_id, request_body=request_body)
++
++    @staticmethod
+     def _build_delete_message_request(message_id: str) -> Any:
+         return _sdk_build(DeleteMessageRequest, message_id=message_id)
+ 
+--- /dev/null
++++ b/plugins/platforms/feishu/card_stream.py
+@@ -0,0 +1,810 @@
++"""Feishu streaming-card presentation for Hermes Agent.
++
++This module reproduces the *user-visible presentation* of the reference project
++``Leorand-dev/openclaw-feishu-patch`` on Hermes' Feishu channel:
++
++* one bounded interactive card per reply (never a wall of bubbles),
++* the answer body streams inside the card,
++* tool-call progress and mid-turn narration are folded into a compact
++  dedicated status block (one primary line + at most one narration ticker line),
++* the waiting line survives across tool batches and switches to
++  ``✅ 已执行 N 个工具 · 生成回复中…`` once the answer starts,
++* the final card removes the status block (no empty gap) and carries the
++  runtime footer as a grey note,
++* a prewarmed card is shown at reply start with an immediate status, and an
++  empty/silent turn discards it instead of leaving a blank card behind.
++
++Pure presentation/state logic only: no ``lark_oapi`` and no ``gateway`` imports,
++so it can be unit-tested anywhere. The Feishu adapter turns :func:`build_card`
++into ``msg_type="interactive"`` sends and ``im.v1.message.patch`` updates; the
++gateway stream consumer drives :class:`CardStreamTurn`.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++import threading
++import time
++from dataclasses import dataclass, field
++from typing import Any, Optional
++
++CARD_STREAM_METADATA_KEY = "hermes_card_stream"
++CARD_SCHEMA_VERSION = 1
++DEFAULT_TITLE = "Hermes"
++
++# --- lightweight observability ------------------------------------------------
++# Counters + best-effort JSONL events. Never contains message content, credentials
++# or chat ids: only event names, booleans and short error codes.
++_METRICS_LOCK = threading.Lock()
++_METRICS_COUNTS: dict[str, int] = {}
++_CARD_METRICS_PATH = os.environ.get(
++    "HERMES_FEISHU_CARD_METRICS",
++    os.path.join(os.path.expanduser("~"), ".hermes", "logs", "feishu_card_metrics.jsonl"),
++)
++
++
++def record_card_event(event: str, **fields: Any) -> None:
++    """Record one card-transport event (counts always; JSONL unless disabled)."""
++    name = str(event or "unknown")
++    with _METRICS_LOCK:
++        _METRICS_COUNTS[name] = int(_METRICS_COUNTS.get(name, 0)) + 1
++        if os.environ.get("HERMES_FEISHU_CARD_METRICS_DISABLE"):
++            return
++        try:
++            os.makedirs(os.path.dirname(_CARD_METRICS_PATH), exist_ok=True)
++            line = json.dumps({"ts": time.time(), "event": name, **fields}, ensure_ascii=False)
++            with open(_CARD_METRICS_PATH, "a", encoding="utf-8") as fh:
++                fh.write(line + "\n")
++        except Exception:
++            pass
++
++
++def card_metric_snapshot() -> dict[str, int]:
++    """In-process counters (useful for diagnostics/tests)."""
++    with _METRICS_LOCK:
++        return dict(_METRICS_COUNTS)
++
++
++def reset_card_metrics() -> None:
++    with _METRICS_LOCK:
++        _METRICS_COUNTS.clear()
++
++# Element/JSON budgets.  Feishu rejects oversized card JSON (the documented
++# content cap for im/message patch/create is 30 KB); keep a safety margin.
++CARD_ELEMENT_MAX_CHARS = 4000
++CARD_MAX_BODY_ELEMENTS = 2            # 2 x 4000 = 8000 chars, Hermes' MAX_MESSAGE_LENGTH
++CARD_BODY_MAX_CHARS = CARD_ELEMENT_MAX_CHARS * CARD_MAX_BODY_ELEMENTS
++CARD_TRUNCATION_NOTICE = "\n\n…（内容较长，完整回复见后续卡片）"
++CARD_JSON_MAX_BYTES = 28000
++CARD_NOTE_MAX_CHARS = 240
++CARD_DETAILS_MAX_CHARS = 240
++CARD_SUMMARY_MAX_CHARS = 50
++
++# Compact-status budgets (reference: 160 per line, 80 narration).
++STATUS_LINE_MAX_CHARS = 160
++STATUS_MAX_CHARS = 400
++NARRATION_MAX_CHARS = 80
++TOOL_LABEL_MAX_CHARS = 24
++ELAPSED_REFRESH_SECONDS = 15.0
++TOOL_ERRORS_MAX = 5
++
++# Header templates.  Progress and final differ so the card reads as "working"
++# and then "done"; the reference keeps a stable identity theme, but Hermes'
++# earlier hand port used this pair and it stays recognizable.
++HEADER_TEMPLATE_PROGRESS = "turquoise"
++HEADER_TEMPLATE_FINAL = "blue"
++HEADER_TEMPLATE_ERROR = "red"
++
++ZERO_WIDTH = "\u200b"
++
++STATUS_PREWARM = "⏳ 思考中…"
++STATUS_PROCESSING = "✍️ 正在生成回复…"
++STATUS_TOOLS_WAITING = "⏳ 已执行 {count} 个工具"
++STATUS_TOOLS_DONE = "✅ 已执行 {count} 个工具 · 生成回复中…"
++STATUS_LAST_TOOL = " · 最后：{label}"
++STATUS_ELAPSED = " · {elapsed}"
++STATUS_WAITING_SUFFIX = "，等待中…"
++NARRATION_PREFIX = "💬 "
++
++DETAILS_PANEL_TITLE = "🧾 运行详情"
++DETAILS_MIN_TOOLS = 3  # small 1–2 tool turns don't need a details block
++FINAL_SUMMARY_DONE = "✅ 完成"
++FINAL_SUMMARY_ERRORS = "⚠️ 完成但有错误"
++CHAT_SUMMARY_FALLBACK = "✅ 已回复"
++
++# Tool label icons (mirrors the reference's per-tool emoji in the details panel).
++TOOL_ICONS = {
++    "terminal": "💻",
++    "process": "⚙️",
++    "background shell": "⚙️",
++    "read file": "📖",
++    "read": "📖",
++    "write file": "✍️",
++    "write": "✍️",
++    "edit file": "🔧",
++    "edit": "🔧",
++    "apply patch": "🔧",
++    "grep": "🔍",
++    "glob": "📁",
++    "ls": "📁",
++    "web search": "🌐",
++    "web fetch": "🌐",
++    "browser": "🌐",
++    "view image": "🖼️",
++    "image": "🖼️",
++    "memory": "🧠",
++    "skill": "📝",
++    "delegate": "🤝",
++    "clarify": "❓",
++}
++DEFAULT_TOOL_ICON = "🔧"
++
++
++_WS_RE = re.compile(r"\s+")
++_MARKDOWN_DECOR_RE = re.compile(r"[*_`#>~]+")
++
++
++def collapse_ws(text: str) -> str:
++    """Collapse every whitespace run (incl. newlines) to one space and strip."""
++    return _WS_RE.sub(" ", str(text or "")).strip()
++
++
++def truncate_cp(text: str, limit: int) -> str:
++    """Surrogate-safe truncation by code point, appending ``…`` when cut."""
++    text = str(text or "")
++    if limit <= 0:
++        return ""
++    if len(text) <= limit:
++        return text
++    return text[: max(0, limit - 1)].rstrip() + "…"
++
++
++def format_elapsed(seconds: Optional[float]) -> str:
++    """Humanize a status elapsed time: ``<1s``, ``12s``, ``1m05s``."""
++    if seconds is None:
++        return ""
++    try:
++        total = max(0, int(round(float(seconds))))
++    except (TypeError, ValueError):
++        return ""
++    if total < 1:
++        return "<1s"
++    if total < 60:
++        return f"{total}s"
++    minutes, secs = divmod(total, 60)
++    return f"{minutes}m{secs:02d}s"
++
++
++def tool_label(tool_name: str) -> str:
++    """Display label for a Hermes tool name (``read_file`` → ``read file``)."""
++    label = collapse_ws(str(tool_name or "").replace("_", " "))
++    return truncate_cp(label or "工具", TOOL_LABEL_MAX_CHARS)
++
++
++def tool_icon(tool_name: str) -> str:
++    """Emoji used for a tool in the ``🧾 运行详情`` panel."""
++    label = tool_label(tool_name).lower()
++    return TOOL_ICONS.get(label, DEFAULT_TOOL_ICON)
++
++
++def summary_text(body: str, limit: int = CARD_SUMMARY_MAX_CHARS) -> str:
++    """Chat-list preview: markdown/code stripped, ``✅ 已回复`` when there is no text."""
++    clean = re.sub(r"```[\s\S]*?```", " ", str(body or ""))
++    # Drop markdown table separator rows and pipe characters from the preview.
++    clean = re.sub(r"(?m)^\s*\|?[\s:|-]+\|?\s*$", " ", clean)
++    clean = clean.replace("|", " ")
++    clean = collapse_ws(_MARKDOWN_DECOR_RE.sub(" ", clean))
++    if not clean:
++        return CHAT_SUMMARY_FALLBACK
++    return truncate_cp(clean, limit)
++
++
++def narration_line(text: str) -> str:
++    """Latest-narration ticker line: one collapsed line capped at 80 chars."""
++    body = collapse_ws(_MARKDOWN_DECOR_RE.sub(" ", str(text or "")))
++    if not body:
++        return ""
++    body = truncate_cp(body, NARRATION_MAX_CHARS - len(NARRATION_PREFIX))
++    return f"{NARRATION_PREFIX}{body}"
++
++
++def split_body_elements(body: str, limit: int = CARD_ELEMENT_MAX_CHARS) -> list[str]:
++    """Split the answer body into Feishu markdown elements at line boundaries."""
++    body = str(body or "")
++    if not body:
++        return []
++    if len(body) <= limit:
++        return [body]
++    chunks: list[str] = []
++    rest = body
++    while rest and len(chunks) < CARD_MAX_BODY_ELEMENTS:
++        if len(rest) <= limit:
++            chunks.append(rest)
++            rest = ""
++            break
++        cut = rest.rfind("\n", 0, limit)
++        if cut < limit // 2:
++            cut = limit
++        chunks.append(rest[:cut])
++        rest = rest[cut:].lstrip("\n")
++    if rest and chunks:
++        # Never silently drop answer text: fold the overflow into the last element
++        # (the adapter refuses >CARD_JSON_MAX_BYTES and falls back to text instead).
++        chunks[-1] = chunks[-1] + "\n" + rest
++    return chunks
++
++
++def fit_card_body(body: str) -> tuple[str, bool]:
++    """Fit an answer body into the card's markdown budget.
++
++    Cards are bounded: a very long answer would blow the 30 KB card JSON cap (and
++    a >4000-char element is not something the reference sends either).  The card
++    shows the head with a pointer, and the stream consumer sends the remainder as
++    ordinary continuation messages once the turn finalizes, so no text is lost.
++    Returns ``(visible_body, truncated)``.
++    """
++    body = str(body or "")
++    if len(body) <= CARD_BODY_MAX_CHARS:
++        return body, False
++    keep = max(0, CARD_BODY_MAX_CHARS - len(CARD_TRUNCATION_NOTICE))
++    return body[:keep].rstrip() + CARD_TRUNCATION_NOTICE, True
++
++
++def _note_element(text: str) -> dict[str, Any]:
++    return {"tag": "note", "elements": [{"tag": "plain_text", "content": truncate_cp(text, CARD_NOTE_MAX_CHARS)}]}
++
++
++# --- markdown pipe-table conversion -----------------------------------------
++# Classic Feishu cards do not render markdown tables: raw ``| ... |`` rows show up
++# as body text. Detect compact pipe tables and render them as a column_set (≤4
++# columns) or a readable list (wider tables).
++_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?\s*$")
++CARD_TABLE_MAX_COLUMNS = 4
++CARD_TABLE_MAX_ROWS = 20
++
++
++def _split_pipe_row(line: str) -> list[str]:
++    text = str(line or "").strip()
++    if text.startswith("|"):
++        text = text[1:]
++    if text.endswith("|"):
++        text = text[:-1]
++    return [collapse_ws(cell) for cell in text.split("|")]
++
++
++def _table_block(lines: list[str], start: int) -> Optional[tuple[list[str], list[list[str]], int]]:
++    """Return ``(headers, rows, next_index)`` when ``lines[start:]`` starts a table."""
++    if start + 1 >= len(lines):
++        return None
++    header_line = lines[start]
++    if header_line.count("|") < 2 or not _TABLE_SEP_RE.match(lines[start + 1]):
++        return None
++    headers = _split_pipe_row(header_line)
++    if len(headers) < 2:
++        return None
++    rows: list[list[str]] = []
++    i = start + 2
++    while i < len(lines):
++        line = lines[i]
++        if not line.strip() or line.count("|") < 2:
++            break
++        cells = _split_pipe_row(line)
++        if len(cells) < 2:
++            break
++        if len(cells) < len(headers):
++            cells.extend([""] * (len(headers) - len(cells)))
++        rows.append(cells[: len(headers)])
++        i += 1
++        if len(rows) >= CARD_TABLE_MAX_ROWS:
++            break
++    if not rows:
++        return None
++    return headers, rows, i
++
++
++def _table_elements(headers: list[str], rows: list[list[str]]) -> list[dict[str, Any]]:
++    """Render a table as column_set (narrow) or a header + bullet list (wide)."""
++    columns = len(headers)
++    if columns <= CARD_TABLE_MAX_COLUMNS:
++        cols = []
++        for index, header in enumerate(headers):
++            values = [row[index] if index < len(row) else "" for row in rows]
++            content = f"**{header}**\n" + "\n".join(v or "—" for v in values)
++            cols.append({
++                "tag": "column",
++                "width": "weighted",
++                "weight": 1,
++                "elements": [{"tag": "markdown", "content": content}],
++            })
++        return [{
++            "tag": "column_set",
++            "flex_mode": "none",
++            "background_style": "default",
++            "columns": cols,
++        }]
++    intro = "**表格** · " + " · ".join(headers)
++    lines = []
++    for row in rows:
++        cells = [cell for cell in row if cell]
++        if cells:
++            lines.append("- **" + cells[0] + "**" + (" · " + " · ".join(cells[1:]) if len(cells) > 1 else ""))
++    return [
++        {"tag": "markdown", "content": intro},
++        {"tag": "markdown", "content": "\n".join(lines) if lines else "（空表）"},
++    ]
++
++
++def body_to_card_elements(body: str) -> list[dict[str, Any]]:
++    """Split an answer body into markdown/card elements, converting pipe tables."""
++    body = str(body or "")
++    if not body:
++        return []
++    lines = body.splitlines()
++    elements: list[dict[str, Any]] = []
++    buffer: list[str] = []
++
++    def flush() -> None:
++        if not buffer:
++            return
++        segment = "\n".join(buffer).strip("\n")
++        buffer.clear()
++        if not segment.strip():
++            return
++        elements.extend(
++            {"tag": "markdown", "content": chunk}
++            for chunk in split_body_elements(segment)
++        )
++
++    in_fence = False
++    i = 0
++    while i < len(lines):
++        line = lines[i]
++        if line.strip().startswith("```"):
++            in_fence = not in_fence
++            buffer.append(line)
++            i += 1
++            continue
++        if not in_fence:
++            table = _table_block(lines, i)
++            if table is not None:
++                flush()
++                headers, rows, i = table
++                elements.extend(_table_elements(headers, rows))
++                continue
++        buffer.append(line)
++        i += 1
++    flush()
++    return elements
++
++
++
++def details_note_element(content: str) -> dict[str, Any]:
++    """Compact grey progress line used while the card is still streaming."""
++    return {
++        "tag": "note",
++        "elements": [{"tag": "plain_text", "content": truncate_cp(content, CARD_DETAILS_MAX_CHARS)}],
++    }
++
++
++def stats_div_element(stats: dict[str, Any]) -> Optional[dict[str, Any]]:
++    """Structured final ``🧾 运行详情`` block (only for meaningful turns).
++
++    The completion summary already carries the tool count and the footer carries the
++    elapsed time, so this block shows only the tool breakdown and errors: no duplicated
++    counts/duration, no details for tiny 1–2 tool turns.
++    """
++    if not stats:
++        return None
++    total = int(stats.get("tool_total") or 0)
++    errors = [str(e) for e in (stats.get("errors") or []) if str(e)]
++    if total < DETAILS_MIN_TOOLS and not errors:
++        return None
++    fields: list[dict[str, Any]] = []
++    counts = list(stats.get("counts") or [])
++    if counts:
++        parts = [f"{c.get('icon') or DEFAULT_TOOL_ICON} {c.get('label')}×{c.get('count')}" for c in counts[:8]]
++        if len(counts) > 8:
++            parts.append("其他×" + str(sum(int(c.get("count") or 0) for c in counts[8:])))
++        fields.append({
++            "is_short": False,
++            "text": {"tag": "lark_md", "content": "**主要工具**\n" + " · ".join(parts)},
++        })
++    if errors:
++        fields.append({
++            "is_short": False,
++            "text": {"tag": "lark_md", "content": "**⚠️ 错误**\n" + "；".join(errors[:2])},
++        })
++    if not fields:
++        return None
++    return {
++        "tag": "div",
++        "text": {"tag": "lark_md", "content": "🧾 **运行详情**"},
++        "fields": fields,
++    }
++
++
++def build_card(payload: dict[str, Any], *, title_fallback: str = DEFAULT_TITLE) -> dict[str, Any]:
++    """Build the Feishu card JSON for one streaming frame.
++
++    Streaming frames: status line at the TOP, answer body, compact grey details line,
++    footer note. Final frames: answer body, ``hr``, a blockquote completion summary,
++    a structured ``🧾 运行详情`` div (tool/elapsed/error fields — roomy two-column
++    layout instead of one crammed grey line), then ``hr`` + footer note.
++
++    ``payload`` is the ``metadata["hermes_card_stream"]`` contract produced by
++    :meth:`CardStreamTurn.render_payload`.
++    """
++    payload = payload or {}
++    final = bool(payload.get("final"))
++    body, _truncated = fit_card_body(str(payload.get("body") or ""))
++    notice = "" if final else str(payload.get("notice") or "")
++    status = notice or ("" if final else str(payload.get("status") or ""))
++    footer = str(payload.get("footer") or "")
++    details = truncate_cp(str(payload.get("details") or ""), CARD_DETAILS_MAX_CHARS)
++    stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
++    chat_summary = str(payload.get("chat_summary") or "")
++    summary = str((stats or {}).get("summary") or "")
++    title = collapse_ws(str(payload.get("title") or "")) or str(title_fallback or DEFAULT_TITLE)
++    errorish = final and (
++        str(payload.get("template") or "") == HEADER_TEMPLATE_ERROR
++        or str(payload.get("error") or "")
++        or str(body).lstrip().startswith(("⚠️", "❌", "⛔"))
++    )
++    if payload.get("capsule", True):
++        suffix = " · 出错" if errorish else " · 完成" if final else " · 运行中"
++        if not title.endswith(suffix):
++            title = f"{title}{suffix}"
++    body_elements = body_to_card_elements(body)
++
++    elements: list[dict[str, Any]] = []
++    if final:
++        if body_elements:
++            elements.extend(body_elements)
++        if summary:
++            if body_elements:
++                elements.append({"tag": "hr"})
++            elements.append({"tag": "markdown", "content": f"> {summary}"})
++        stats_block = stats_div_element(stats)
++        if stats_block is not None:
++            elements.append(stats_block)
++        if not body_elements and not summary:
++            elements.append({"tag": "markdown", "content": ZERO_WIDTH})
++    else:
++        if status:
++            elements.append({"tag": "markdown", "content": status})
++        if body_elements:
++            elements.extend(body_elements)
++        else:
++            elements.append({"tag": "markdown", "content": ZERO_WIDTH})
++        if details.strip():
++            elements.append(details_note_element(details))
++    if footer:
++        elements.append({"tag": "hr"})
++        elements.append(_note_element(footer))
++
++    if errorish:
++        template = HEADER_TEMPLATE_ERROR
++    else:
++        template = str(payload.get("template") or "").strip() or (
++            HEADER_TEMPLATE_FINAL if final else HEADER_TEMPLATE_PROGRESS
++        )
++    config: dict[str, Any] = {"wide_screen_mode": True, "update_multi": True}
++    if final:
++        config["summary"] = {"content": chat_summary or summary_text(body)}
++    return {
++        "config": config,
++        "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
++        "elements": elements,
++    }
++
++
++def build_card_json(payload: dict[str, Any], *, title_fallback: str = DEFAULT_TITLE) -> str:
++    """Serialize :func:`build_card` to the JSON string Feishu's API expects."""
++    return json.dumps(build_card(payload, title_fallback=title_fallback), ensure_ascii=False)
++
++
++def card_json_too_large(card_json: str) -> bool:
++    return len(str(card_json or "").encode("utf-8")) > CARD_JSON_MAX_BYTES
++
++
++def payload_signature(payload: dict[str, Any]) -> str:
++    """Stable signature used to skip unchanged card patches."""
++    if not payload:
++        return ""
++    return "\x1f".join(
++        (
++            "1" if payload.get("final") else "0",
++            str(payload.get("template") or ""),
++            str(payload.get("title") or ""),
++            str(payload.get("body") or ""),
++            str(payload.get("status") or ""),
++            str(payload.get("details") or ""),
++            str(payload.get("footer") or ""),
++        )
++    )
++
++
++def status_signature(payload: dict[str, Any]) -> str:
++    """Signature of the non-body parts (status/details/footer/final)."""
++    if not payload:
++        return ""
++    return "\x1f".join(
++        (
++            "1" if payload.get("final") else "0",
++            str(payload.get("status") or ""),
++            str(payload.get("details") or ""),
++            str(payload.get("footer") or ""),
++        )
++    )
++
++
++def merge_cumulative_text(current: str, incoming: str) -> str:
++    """Merge cumulative block text without duplicating already-shown prefixes.
++
++    The gateway can deliver the same block more than once (retry / reorder); the
++    reference ``mergeStreamingText`` drops equal copies, replaces a short-copy
++    with its extension, merges prefix/suffix overlaps, and only then appends.
++    """
++    cur = str(current or "")
++    new = str(incoming or "")
++    if not new:
++        return cur
++    if not cur:
++        return new
++    if new == cur:
++        return cur
++    if cur.startswith(new):
++        return cur
++    if new.startswith(cur):
++        return new
++    # prefix/suffix overlap: "abcde" + "def" -> "abcdef"
++    max_overlap = min(len(cur), len(new))
++    for size in range(max_overlap, 0, -1):
++        if cur.endswith(new[:size]):
++            return cur + new[size:]
++    return cur + new
++
++
++@dataclass
++class CardStreamTurn:
++    """Per-turn state machine for one Feishu streaming card.
++
++    One instance == one reply.  It is mutated from the gateway's stream-consumer
++    loop (never concurrently) and rendered into ``hermes_card_stream`` payloads.
++
++    Presentation follows the reference project's 2026.10.6 layout: a single
++    phase status line at the TOP, the answer body, a compact streaming details
++    line, and (at final) a separated completion summary + structured
++    ``🧾 运行详情`` fields block + grey runtime-footer note.
++    """
++
++    title: str = DEFAULT_TITLE
++    now: float = field(default_factory=time.monotonic)
++    body: str = ""
++    narration: str = ""
++    footer: str = ""
++    tool_total: int = 0
++    tools_running: int = 0
++    last_tool_label: str = ""
++    last_tool_detail: str = ""
++    tool_counts: dict[str, dict[str, Any]] = field(default_factory=dict)
++    tool_errors: list[str] = field(default_factory=list)
++    notice: str = ""
++    turn_started_ts: Optional[float] = None
++    tool_phase_started_ts: Optional[float] = None
++    tool_phase_completed: bool = False
++    answer_started: bool = False
++    prewarmed: bool = False
++    final: bool = False
++
++    # ---- event mutations -------------------------------------------------
++
++    def mark_prewarmed(self, now: Optional[float] = None) -> None:
++        self.prewarmed = True
++        if self.turn_started_ts is None:
++            self.turn_started_ts = self.now if now is None else now
++
++    def on_tool_started(self, name: str, now: Optional[float] = None, detail: str = "") -> None:
++        now = self.now if now is None else now
++        label = tool_label(name)
++        self.notice = ""
++        self.tool_total += 1
++        self.tools_running += 1
++        self.last_tool_label = label
++        self.last_tool_detail = collapse_ws(str(detail or ""))[:60]
++        entry = self.tool_counts.get(label)
++        if entry is None:
++            self.tool_counts[label] = {"icon": tool_icon(name), "label": label, "count": 1}
++        else:
++            entry["count"] = int(entry.get("count") or 0) + 1
++        if self.tool_phase_started_ts is None:
++            self.tool_phase_started_ts = now
++        self.tool_phase_completed = False
++
++    def on_tool_completed(self, now: Optional[float] = None, is_error: bool = False, detail: str = "") -> None:
++        self.tools_running = max(0, self.tools_running - 1)
++        if is_error:
++            label = self.last_tool_label or "工具"
++            icon = TOOL_ICONS.get(label.lower(), DEFAULT_TOOL_ICON)
++            reason = collapse_ws(_MARKDOWN_DECOR_RE.sub(" ", str(detail or "")))
++            if reason and reason.casefold() != label.casefold():
++                self.tool_errors.append(f"{icon} {label} 执行失败：{truncate_cp(reason, 90)}")
++            else:
++                self.tool_errors.append(f"{icon} {label} 执行失败")
++            del self.tool_errors[:-20]
++
++    def on_step(self, iteration: int) -> None:
++        """Accepted for API compatibility; the reference layout has no step counter."""
++        return
++
++    def on_answer_started(self, now: Optional[float] = None) -> None:
++        if self.answer_started:
++            return
++        self.answer_started = True
++        self.notice = ""
++        if self.tool_total:
++            self.tool_phase_completed = True
++
++    def on_narration(self, text: str, now: Optional[float] = None) -> None:
++        line = narration_line(text)
++        if line:
++            self.narration = line
++            self.notice = ""
++
++    def on_notice(self, text: str, now: Optional[float] = None) -> None:
++        """Transient gateway diagnostic (provider retry, redirect) rendered in-card."""
++        line = collapse_ws(_MARKDOWN_DECOR_RE.sub(" ", str(text or "")))
++        if line:
++            self.notice = truncate_cp(line, STATUS_LINE_MAX_CHARS)
++
++    def set_body(self, text: str, now: Optional[float] = None) -> None:
++        """Replace the body with the consumer's authoritative accumulated text."""
++        self.body = str(text or "")
++        if self.body:
++            self.on_answer_started(now)
++
++    def set_footer(self, footer: str) -> None:
++        self.footer = truncate_cp(collapse_ws(footer), CARD_NOTE_MAX_CHARS)
++
++    def finalize(self, footer: str = "", now: Optional[float] = None) -> None:
++        if footer:
++            self.set_footer(footer)
++        self.final = True
++
++    # ---- details line (compact grey note; classic cards cannot collapse) ---
++
++    def _tools_compact(self) -> str:
++        entries = sorted(self.tool_counts.values(), key=lambda e: int(e.get("count") or 0), reverse=True)
++        if not entries:
++            return ""
++        parts = []
++        for entry in entries[:5]:
++            parts.append(f"{entry.get('icon') or DEFAULT_TOOL_ICON}{entry.get('label')}×{entry.get('count')}")
++        if len(entries) > 5:
++            rest = sum(int(e.get("count") or 0) for e in entries[5:])
++            parts.append(f"其他×{rest}")
++        return f"共 {self.tool_total} 次：" + "、".join(parts)
++
++    def _errors_compact(self) -> str:
++        if not self.tool_errors:
++            return ""
++        return f"⚠️ {len(self.tool_errors)} 个错误：" + "；".join(self.tool_errors[-2:])
++
++    def details_text(self, now: Optional[float] = None) -> str:
++        """Compact streaming progress line (tools / errors only; final uses fields)."""
++        parts = []
++        tools = self._tools_compact()
++        if tools:
++            parts.append(tools)
++        errors = self._errors_compact()
++        if errors:
++            parts.append(errors)
++        if not parts:
++            return ""
++        return truncate_cp(f"{DETAILS_PANEL_TITLE} · " + " · ".join(parts), CARD_DETAILS_MAX_CHARS)
++
++    def stats(self, now: Optional[float] = None) -> dict[str, Any]:
++        """Structured final statistics for the ``🧾 运行详情`` fields block."""
++        entries = sorted(self.tool_counts.values(), key=lambda e: int(e.get("count") or 0), reverse=True)
++        return {
++            "tool_total": int(self.tool_total),
++            "counts": [
++                {"icon": e.get("icon") or DEFAULT_TOOL_ICON, "label": e.get("label"), "count": int(e.get("count") or 0)}
++                for e in entries
++            ],
++            "errors": list(self.tool_errors[-TOOL_ERRORS_MAX:]),
++            "summary": self.final_summary_line(now),
++        }
++
++    # ---- rendering -------------------------------------------------------
++
++    def _waiting_primary(self, now: float) -> str:
++        if self.tool_phase_completed:
++            return STATUS_TOOLS_DONE.format(count=self.tool_total)
++        primary = STATUS_TOOLS_WAITING.format(count=self.tool_total)
++        details = []
++        if self.last_tool_label:
++            details.append(STATUS_LAST_TOOL.format(label=self.last_tool_label))
++        if self.tool_phase_started_ts is not None:
++            elapsed = format_elapsed(now - self.tool_phase_started_ts)
++            if elapsed:
++                details.append(STATUS_ELAPSED.format(elapsed=elapsed))
++        if details:
++            return primary + "".join(details)
++        return primary + STATUS_WAITING_SUFFIX
++
++    def status_text(self, now: Optional[float] = None) -> str:
++        """Single phase status line (reference: no second narration line)."""
++        if self.final:
++            return ""
++        if self.notice:
++            return truncate_cp(self.notice, STATUS_LINE_MAX_CHARS)
++        now = self.now if now is None else now
++        if self.tool_total:
++            primary = self._waiting_primary(now)
++        elif self.narration:
++            primary = self.narration
++        elif self.answer_started or self.body:
++            primary = STATUS_PROCESSING
++        else:
++            primary = STATUS_PREWARM
++        return truncate_cp(primary, STATUS_LINE_MAX_CHARS)
++
++    def final_summary_line(self, now: Optional[float] = None) -> str:
++        # Duration is shown once, in the footer's latency field; the summary carries
++        # only the outcome and tool/error counts to avoid 2–3 near-identical timings.
++        if not (self.tool_total or self.tool_errors):
++            return ""
++        parts = [FINAL_SUMMARY_ERRORS if self.tool_errors else FINAL_SUMMARY_DONE]
++        if self.tool_total:
++            parts.append(f"{self.tool_total} 个工具")
++        if self.tool_errors:
++            parts.append(f"{len(self.tool_errors)} 个错误")
++        return " · ".join(parts)
++
++    def render_payload(self, now: Optional[float] = None, *, final: Optional[bool] = None) -> dict[str, Any]:
++        """Build the ``hermes_card_stream`` payload for the current state."""
++        now = self.now if now is None else now
++        is_final = self.final if final is None else bool(final)
++        if self.turn_started_ts is None:
++            self.turn_started_ts = now
++        if is_final:
++            self.on_answer_started(now)
++            status = ""
++            body = self.body
++            details = ""
++            stats = self.stats(now)
++            chat_summary = summary_text(self.body) if self.body.strip() else CHAT_SUMMARY_FALLBACK
++        else:
++            status = self.status_text(now)
++            body = self.body
++            details = self.details_text(now)
++            stats = self.stats(now)
++            chat_summary = ""
++        payload = {
++            "schema": CARD_SCHEMA_VERSION,
++            "title": self.title,
++            "body": body,
++            "status": status,
++            "notice": "" if is_final else self.notice,
++            "details": details,
++            "stats": stats,
++            "chat_summary": chat_summary,
++            "footer": self.footer,
++            "final": is_final,
++            "template": HEADER_TEMPLATE_FINAL if is_final else HEADER_TEMPLATE_PROGRESS,
++        }
++        return payload
++
++    def discard_worthy(self) -> bool:
++        """An empty prewarmed card (silent/skip turn) should be deleted, not left blank."""
++        return bool(
++            self.prewarmed
++            and not self.final
++            and not self.body
++            and not self.tool_total
++            and not self.narration
++            and not self.notice
++        )
+--- /dev/null
++++ b/plugins/platforms/feishu/cardkit_v2.py
+@@ -0,0 +1,230 @@
++"""CardKit 2.0 (schema 2.0) builders for the Feishu streaming card.
++
++Optional transport: classic card JSON remains the default because older Feishu
++clients render a "please upgrade" block for 2.0 cards. When the client supports
++2.0 (>= 7.20), the adapter can use card entities + element-level content updates
++and a final full-card swap with native table / collapsible_panel elements.
++
++This module is pure (no lark_oapi imports) so it can be unit-tested.
++"""
++
++from __future__ import annotations
++
++import json
++from typing import Any, Optional
++
++try:  # Hermes package context
++    from plugins.platforms.feishu import card_stream as _cs
++except ImportError:  # unit tests add the feishu dir to sys.path
++    import card_stream as _cs  # type: ignore[no-redef]
++
++SCHEMA = "2.0"
++
++
++def _element_id(prefix: str, index: int) -> str:
++    # CardKit: [A-Za-z][A-Za-z0-9_]{0,19}
++    return f"{prefix}{index}"[:20]
++
++
++def _markdown(element_id: str, content: str) -> dict[str, Any]:
++    return {"tag": "markdown", "element_id": element_id, "content": content or "\u200b"}
++
++
++def status_markdown(text: str) -> str:
++    """Small grey status line (no blockquote, no extra visual weight)."""
++    return f"<font color='grey'>{_cs.collapse_ws(str(text or ''))}</font>"
++
++
++def _status_element(text: str) -> dict[str, Any]:
++    return {
++        "tag": "markdown",
++        "element_id": "status",
++        "content": status_markdown(text) if str(text or "").strip() else _cs.ZERO_WIDTH,
++        "text_size": "notation",
++    }
++
++
++def _header(payload: dict[str, Any], title_fallback: str, final: bool, errorish: bool) -> dict[str, Any]:
++    base = _cs.collapse_ws(str(payload.get("title") or "")) or str(title_fallback or _cs.DEFAULT_TITLE)
++    if errorish:
++        label, tag_color, template = "出错", "red", "red"
++    elif final:
++        label, tag_color, template = "完成", "neutral", "grey"
++    else:
++        label, tag_color, template = "生成中", "neutral", "blue"
++    return {
++        "title": {"tag": "plain_text", "content": base},
++        "text_tag_list": [
++            {"tag": "text_tag", "text": {"tag": "plain_text", "content": label}, "color": tag_color},
++        ],
++        "template": template,
++    }
++
++
++def _table_elements(body: str, *, limit_tables: int = 5) -> list[dict[str, Any]]:
++    """Convert markdown pipe tables to native 2.0 table elements; returns [] if none."""
++    lines = str(body or "").splitlines()
++    tables: list[dict[str, Any]] = []
++    i = 0
++    while i < len(lines) and len(tables) < limit_tables:
++        parsed = None
++        try:
++            parsed = _cs._table_block(lines, i)  # type: ignore[attr-defined]
++        except Exception:
++            parsed = None
++        if parsed is None:
++            i += 1
++            continue
++        headers, rows, i = parsed
++        columns = [
++            {"name": f"c{idx}", "display_name": str(header or f"列{idx + 1}"),
++             "data_type": "text", "width": "auto"}
++            for idx, header in enumerate(headers)
++        ]
++        table_rows = []
++        for row in rows:
++            table_rows.append({f"c{idx}": str(row[idx] if idx < len(row) else "") for idx in range(len(headers))})
++        tables.append({
++            "tag": "table",
++            "element_id": _element_id("tbl", len(tables)),
++            "page_size": 10,
++            "row_height": "auto",
++            "freeze_first_column": True,
++            "header_style": {"text_align": "left", "text_size": "normal",
++                             "background_style": "none", "text_color": "grey",
++                             "bold": True, "lines": 1},
++            "columns": columns,
++            "rows": table_rows,
++        })
++    return tables
++
++
++def _body_markdown_without_tables(body: str) -> str:
++    """Remove table blocks for streaming text (tables appear only in the final swap)."""
++    lines = str(body or "").splitlines()
++    out: list[str] = []
++    i = 0
++    while i < len(lines):
++        parsed = None
++        try:
++            parsed = _cs._table_block(lines, i)  # type: ignore[attr-defined]
++        except Exception:
++            parsed = None
++        if parsed is not None:
++            _headers, _rows, i = parsed
++            continue
++        out.append(lines[i])
++        i += 1
++    return "\n".join(out).strip()
++
++
++def streaming_content(payload: dict[str, Any]) -> str:
++    """One streaming markdown element: status line + answer body (no empty placeholder)."""
++    payload = payload or {}
++    status = str(payload.get("status") or payload.get("notice") or "").strip()
++    body, _truncated = _cs.fit_card_body(str(payload.get("body") or ""))
++    body = _body_markdown_without_tables(body)
++    parts: list[str] = []
++    if status:
++        parts.append(f"> {status}")
++    if body:
++        parts.append(body)
++    return "\n\n".join(parts) or _cs.ZERO_WIDTH
++
++
++def _details_panel(stats: dict[str, Any]) -> Optional[dict[str, Any]]:
++    total = int((stats or {}).get("tool_total") or 0)
++    errors = [str(e) for e in ((stats or {}).get("errors") or []) if str(e)]
++    if total < 3 and not errors:
++        return None
++    lines: list[str] = []
++    counts = list((stats or {}).get("counts") or [])
++    if counts:
++        parts = [f"{c.get('icon') or _cs.DEFAULT_TOOL_ICON} {c.get('label')}×{c.get('count')}" for c in counts[:8]]
++        if len(counts) > 8:
++            parts.append("其他×" + str(sum(int(c.get("count") or 0) for c in counts[8:])))
++        lines.append("**主要工具**\n" + " · ".join(parts))
++    if errors:
++        lines.append("**⚠️ 错误**\n" + "；".join(errors[:2]))
++    return {
++        "tag": "collapsible_panel",
++        "element_id": "detailspanel",
++        "expanded": False,
++        "header": {
++            "title": {"tag": "plain_text", "content": "🧾 运行详情"},
++            "vertical_align": "center",
++            "icon": {"tag": "standard_icon", "token": "down-small-ccm_outlined",
++                     "color": "", "size": "16px 16px"},
++            "icon_position": "right",
++            "icon_expanded_angle": -180,
++        },
++        "border": {"color": "grey", "corner_radius": "5px"},
++        "vertical_spacing": "8px",
++        "padding": "8px 8px 8px 8px",
++        "elements": [_markdown("detailspanel_body", "\n\n".join(lines) or "\u200b")],
++    }
++
++
++def _footer_element(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
++    footer = str(payload.get("footer") or "").strip()
++    if not footer:
++        return None
++    return _markdown("footer", f"<font color='grey'>{footer}</font>")
++
++
++def build_card_v2(payload: dict[str, Any], *, title_fallback: str = _cs.DEFAULT_TITLE) -> dict[str, Any]:
++    """Build a schema-2.0 card for a streaming or final frame."""
++    payload = payload or {}
++    final = bool(payload.get("final"))
++    body, _truncated = _cs.fit_card_body(str(payload.get("body") or ""))
++    stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
++    summary = str((stats or {}).get("summary") or "")
++    chat_summary = str(payload.get("chat_summary") or "")
++    errorish = final and (
++        str(payload.get("template") or "") == _cs.HEADER_TEMPLATE_ERROR
++        or str(body).lstrip().startswith(("⚠️", "❌", "⛔"))
++    )
++    elements: list[dict[str, Any]] = []
++    if final:
++        # Native table elements are root-level; text around them is rendered as one markdown.
++        text_body = _body_markdown_without_tables(body)
++        table_elements = _table_elements(body)
++        if text_body:
++            elements.append(_markdown("content", text_body))
++        elif not table_elements:
++            elements.append(_markdown("content", _cs.ZERO_WIDTH))
++        if summary:
++            elements.append(_markdown("summary", f"> {summary}"))
++        elements.extend(table_elements)
++        panel = _details_panel(stats)
++        if panel is not None:
++            elements.append(panel)
++    else:
++        status = str(payload.get("status") or payload.get("notice") or "")
++        elements.append(_status_element(status))
++        text_body = _body_markdown_without_tables(body)
++        if text_body:
++            elements.append(_markdown("content", text_body))
++    footer = _footer_element(payload)
++    if final and footer is not None:
++        elements.append(footer)
++    config: dict[str, Any] = {
++        "streaming_mode": not final,
++        "update_multi": True,
++        "summary": {"content": chat_summary or _cs.summary_text(body)},
++        "streaming_config": {
++            "print_frequency_ms": {"default": 50},
++            "print_step": {"default": 1},
++            "print_strategy": "fast",
++        },
++    }
++    return {
++        "schema": SCHEMA,
++        "config": config,
++        "header": _header(payload, title_fallback, final, errorish),
++        "body": {"direction": "vertical", "elements": elements},
++    }
++
++
++def build_card_v2_json(payload: dict[str, Any], *, title_fallback: str = _cs.DEFAULT_TITLE) -> str:
++    return json.dumps(build_card_v2(payload, title_fallback=title_fallback), ensure_ascii=False)
